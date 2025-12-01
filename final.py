@@ -33,6 +33,10 @@ def select_columns(
         "WEIGHT",
         "Patient_Source",
         "Anesthesia_Method",
+        "Lab_Values",
+        "Medication_Usage",
+        "properties_display",
+        "Catheter_Use",
     ),
 ) -> pd.DataFrame:
     """Return a copy of the dataframe restricted to the specified columns."""
@@ -50,6 +54,19 @@ FEATURE_COLUMNS: list[str] = [
     "WEIGHT",
     "Patient_Source",
     "Anesthesia_Method",
+    # Engineered clinical features
+    "num_lab_abnormal_high",
+    "num_lab_abnormal_low",
+    "num_lab_abnormal_total",
+    "anemia_flag",
+    "renal_impairment_flag",
+    "electrolyte_imbalance_flag",
+    "diabetes_med_flag",
+    "antihypertensive_flag",
+    "anticoagulant_flag",
+    "opioid_flag",
+    "has_urinary_catheter",
+    "num_catheters",
 ]
 
 
@@ -127,6 +144,77 @@ def convert_height_to_cm(series: pd.Series) -> pd.Series:
     return inches * 2.54
 
 
+def add_clinical_text_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Derive simple clinically meaningful features from long text fields:
+    Lab_Values, Medication_Usage, properties_display, Catheter_Use.
+    """
+    # Work on a copy to avoid side effects if reused, but return the same reference
+    # for chaining convenience.
+    if "Lab_Values" in df.columns:
+        lab = df["Lab_Values"].astype("string").fillna("")
+        lab_upper = lab.str.upper()
+        # Count abnormal highs and lows
+        df["num_lab_abnormal_high"] = lab.str.count(r"\(H\)").astype("int16")
+        df["num_lab_abnormal_low"] = lab.str.count(r"\(L\)").astype("int16")
+        df["num_lab_abnormal_total"] = (
+            df["num_lab_abnormal_high"] + df["num_lab_abnormal_low"]
+        ).astype("int16")
+        # Simple condition flags
+        df["anemia_flag"] = (
+            lab_upper.str.contains("HEMOGLOBIN") & lab.str.contains(r"\(L\)")
+            | lab_upper.str.contains("HEMATOCRIT") & lab.str.contains(r"\(L\)")
+        ).astype("int8")
+        df["renal_impairment_flag"] = (
+            lab_upper.str.contains("CREATININE") & lab.str.contains(r"\(H\)")
+        ).astype("int8")
+        df["electrolyte_imbalance_flag"] = (
+            lab_upper.str.contains("SODIUM|POTASSIUM|CALCIUM")
+            & lab.str.contains(r"\((H|L)\)")
+        ).astype("int8")
+
+    if "Medication_Usage" in df.columns:
+        meds = df["Medication_Usage"].astype("string").fillna("").str.upper()
+        df["diabetes_med_flag"] = meds.str.contains(
+            "INSULIN|METFORMIN|GLIPIZIDE|GLYBURIDE|SITAGLIPTIN"
+        ).astype("int8")
+        df["antihypertensive_flag"] = meds.str.contains(
+            "AMLODIPINE|LOSARTAN|LISINOPRIL|METOPROLOL|ATENOLOL|BETA BLOCKER|ACE INHIBITOR|ARB"
+        ).astype("int8")
+        df["anticoagulant_flag"] = meds.str.contains(
+            "WARFARIN|HEPARIN|ENOXAPARIN|XARELTO|APIXABAN|RIVAROXABAN|ASPIRIN|CLOPIDOGREL"
+        ).astype("int8")
+        df["opioid_flag"] = meds.str.contains(
+            "MORPHINE|FENTANYL|HYDROMORPHONE|OXYCODONE|HYDROCODONE"
+        ).astype("int8")
+
+    if "Catheter_Use" in df.columns:
+        cath = df["Catheter_Use"].astype("string").fillna("").str.upper()
+        df["has_urinary_catheter"] = cath.str.contains("URINARY CATHETER").astype("int8")
+        df["num_catheters"] = (
+            cath.apply(lambda s: len([part for part in s.split(",") if part.strip()]))
+        ).astype("int16")
+
+    # Ensure all engineered columns exist even if source columns were missing
+    for col in [
+        "num_lab_abnormal_high",
+        "num_lab_abnormal_low",
+        "num_lab_abnormal_total",
+        "anemia_flag",
+        "renal_impairment_flag",
+        "electrolyte_imbalance_flag",
+        "diabetes_med_flag",
+        "antihypertensive_flag",
+        "anticoagulant_flag",
+        "opioid_flag",
+        "has_urinary_catheter",
+        "num_catheters",
+    ]:
+        if col not in df.columns:
+            df[col] = 0
+    return df
+
+
 def transform_dataset(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
     """
     Select the requested columns and apply the specified transformations.
@@ -166,6 +254,9 @@ def transform_dataset(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
         scaled, params = min_max_scale(working[col].astype(float))
         working[col] = scaled
         scalers[col] = params
+
+    # Add engineered clinical features from long text columns
+    working = add_clinical_text_features(working)
     metadata = {
         "categories": {
             "Anesthesia_Method": anesthesia_categories,
@@ -409,6 +500,10 @@ def prepare_inference_features(
             "WEIGHT",
             "Patient_Source",
             "Anesthesia_Method",
+            "Lab_Values",
+            "Medication_Usage",
+            "properties_display",
+            "Catheter_Use",
         ),
     )
     working["Patient_Source"] = encode_binary_column(
@@ -443,6 +538,9 @@ def prepare_inference_features(
         params = metadata["scalers"][col]
         scaled = min_max_scale(working[col].astype(float), params=params)
         working[col] = scaled
+
+    # Apply same clinical text feature extraction
+    working = add_clinical_text_features(working)
 
     return working.loc[:, FEATURE_COLUMNS]
 
