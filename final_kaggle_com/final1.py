@@ -7,13 +7,14 @@ if "CUDA_VISIBLE_DEVICES" not in os.environ:
 import pandas as pd
 import numpy as np
 import re
-
-from sklearn.model_selection import StratifiedKFold, cross_validate
+# Added train_test_split
+from sklearn.model_selection import StratifiedKFold, cross_validate, train_test_split
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import MinMaxScaler, OneHotEncoder
 from sklearn.impute import SimpleImputer
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
+from sklearn.metrics import classification_report, f1_score # Added for detailed reporting
 
 # Import the 5 requested models
 from sklearn.naive_bayes import MultinomialNB
@@ -29,27 +30,18 @@ TRAIN_PATH = 'kaggle_train_dataset.csv'
 TEST_PATH = 'kaggle_test_dataset.csv'
 SUBMISSION_TEMPLATE = 'kaggle_test_submission.csv'
 
-
 print("Loading data...")
 
 def load_data_robust(filepath):
-    """
-    Robust CSV loader to handle 'EOF inside string' and encoding issues.
-    """
+    """Robust CSV loader."""
     encodings = ['utf-8', 'cp1252', 'latin1']
     for enc in encodings:
         try:
-            # on_bad_lines='skip' ensures one bad row doesn't crash the script
             df = pd.read_csv(filepath, encoding=enc, engine='python', on_bad_lines='skip')
             return df
-        except Exception as e:
-            try:
-                # Fallback for older pandas versions
-                df = pd.read_csv(filepath, encoding=enc, engine='python', error_bad_lines=False)
-                return df
-            except:
-                continue
-    raise ValueError(f"Could not load {filepath}. Check for corruption.")
+        except:
+            continue
+    raise ValueError(f"Could not load {filepath}")
 
 try:
     train_df = load_data_robust(TRAIN_PATH)
@@ -78,15 +70,45 @@ def parse_height(height_str):
     except ValueError:
         return np.nan
 
+def extract_lab_value(text, lab_name):
+    """Regex to find specific lab number (e.g. 'Creatinine: 0.5')"""
+    if pd.isna(text): return np.nan
+    pattern = re.compile(re.escape(lab_name) + r"[:\s]+([\d\.]+)", re.IGNORECASE)
+    match = pattern.search(str(text))
+    if match:
+        try:
+            return float(match.group(1))
+        except:
+            return np.nan
+    return np.nan
+
 def clean_dataframe(df):
     df = df.copy()
+    
+    # 1. Basic Cleaning
     if 'HEIGHT' in df.columns:
         df['HEIGHT_clean'] = df['HEIGHT'].apply(parse_height)
     else:
         df['HEIGHT_clean'] = np.nan
-        
     df['WEIGHT_clean'] = pd.to_numeric(df['WEIGHT'], errors='coerce')
     
+    # 2. BMI Calculation
+    height_m = df['HEIGHT_clean'] * 0.0254
+    df['BMI'] = df['WEIGHT_clean'] / (height_m ** 2)
+    df['BMI'] = df['BMI'].replace([np.inf, -np.inf], np.nan)
+
+    # 3. Elderly Flag
+    df['Is_Elderly'] = (df['Age'] >= 65).astype(int)
+
+    # 4. Extract Specific Lab Values
+    labs_to_extract = ['Creatinine', 'Glucose', 'Hemoglobin', 'Potassium', 'Sodium', 'Urea nitrogen']
+    for lab in labs_to_extract:
+        df[f'Lab_{lab}'] = df['Lab_Values'].apply(lambda x: extract_lab_value(x, lab))
+
+    # 5. Lab Abnormal Count
+    df['Lab_Abnormal_Count'] = df['Lab_Values'].astype(str).apply(lambda x: x.count('(H)') + x.count('(L)'))
+    
+    # 6. Combined Text for TF-IDF
     text_cols = ['Surgery_Name', 'Medication_Usage', 'Lab_Values', 'Catheter_Use']
     for col in text_cols:
         if col in df.columns: df[col] = df[col].fillna('')
@@ -96,7 +118,7 @@ def clean_dataframe(df):
                            df['Lab_Values'] + " " + df['Catheter_Use'])
     return df
 
-print("Preprocessing data...")
+print("Preprocessing: Extracting specific lab values and BMI...")
 train_clean = clean_dataframe(train_df)
 test_clean = clean_dataframe(test_df)
 
@@ -105,22 +127,35 @@ y = train_clean['ASA_Rating']
 X_test = test_clean
 
 # ==========================================
-# 3. Pipeline Construction
+# 3. SPLIT TRAINING DATA (Local Validation)
+# ==========================================
+# We split the training data 80/20.
+# 80% is used to train, 20% is used to "validate" (simulate the test).
+print("Splitting 'kaggle_train_dataset' into Training (80%) and Local Validation (20%)...")
+X_train_split, X_val_split, y_train_split, y_val_split = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+# ==========================================
+# 4. Pipeline Construction
 # ==========================================
 
-numeric_features = ['Age', 'HEIGHT_clean', 'WEIGHT_clean']
+numeric_features = [
+    'Age', 'HEIGHT_clean', 'WEIGHT_clean', 'BMI', 'Lab_Abnormal_Count',
+    'Lab_Creatinine', 'Lab_Glucose', 'Lab_Hemoglobin', 'Lab_Potassium', 'Lab_Sodium', 'Lab_Urea nitrogen'
+]
+
 numeric_transformer = Pipeline(steps=[
     ('imputer', SimpleImputer(strategy='median')),
-    ('scaler', MinMaxScaler()) 
+    ('scaler', MinMaxScaler())
 ])
 
-categorical_features = ['Gender', 'ICU_Patient', 'Anesthesia_Method', 'Patient_Source']
+categorical_features = ['Gender', 'ICU_Patient', 'Anesthesia_Method', 'Patient_Source', 'Is_Elderly']
 categorical_transformer = Pipeline(steps=[
     ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
     ('onehot', OneHotEncoder(handle_unknown='ignore'))
 ])
 
-# Increased max_features to 3000 to capture more medical terms
 text_features = 'combined_text'
 text_transformer = Pipeline(steps=[
     ('tfidf', TfidfVectorizer(max_features=3000, stop_words='english', ngram_range=(1,2)))
@@ -134,43 +169,25 @@ preprocessor = ColumnTransformer(
     ])
 
 # ==========================================
-# 4. TUNED Experiment Setup (5 Methods)
+# 5. Models
 # ==========================================
 
 models = {
-    # Alpha 0.01: Very low smoothing lets it catch rare medical terms aggressively
     "Method #1 (Naive Bayes)": MultinomialNB(alpha=0.01),
-    
-    # Class Weight Balanced: Crucial for fixing the imbalance between Ratings 1-4
-    "Method #2 (Logistic Regression)": LogisticRegression(
-        max_iter=3000, C=1.5, solver='liblinear', class_weight='balanced'
-    ),
-    
-    # Min Samples Leaf 10: Prevents "over-memorizing" single patients
-    "Method #3 (Decision Tree)": DecisionTreeClassifier(
-        max_depth=20, min_samples_leaf=10, class_weight='balanced', random_state=42
-    ),
-    
-    # Metric Cosine: Much better for Text (TF-IDF) data than standard distance
-    "Method #4 (KNN)": KNeighborsClassifier(
-        n_neighbors=19, weights='distance', metric='cosine'
-    ),
-    
-    # C=0.2: Stronger regularization prevents overfitting on the text data
-    "Method #5 (SVM)": LinearSVC(
-        C=0.2, class_weight='balanced', dual=False, random_state=42, max_iter=3000
-    )
+    "Method #2 (Logistic Regression)": LogisticRegression(max_iter=3000, C=1.5, solver='liblinear', class_weight='balanced'),
+    "Method #3 (Decision Tree)": DecisionTreeClassifier(max_depth=20, min_samples_leaf=15, class_weight='balanced', random_state=42),
+    "Method #4 (KNN)": KNeighborsClassifier(n_neighbors=19, weights='distance', metric='cosine'),
+    "Method #5 (SVM)": LinearSVC(C=0.3, class_weight='balanced', dual=False, random_state=42, max_iter=3000)
 }
 
 # ==========================================
-# 5. Training, Evaluation & Submission
+# 6. Training, Evaluation & Submission
 # ==========================================
 
 print("\n" + "="*60)
-print("STARTING TUNED EXPERIMENTS")
+print("STARTING EXPERIMENTS WITH VALIDATION SPLIT")
 print("="*60)
 
-# ID Handling
 submission_ids = None
 if os.path.exists(SUBMISSION_TEMPLATE):
     try:
@@ -185,7 +202,14 @@ for name, model in models.items():
     
     clf = Pipeline(steps=[('preprocessor', preprocessor), ('classifier', model)])
     
-    # Cross Validation
+    #  Local Validation Split
+    clf.fit(X_train_split, y_train_split)
+    val_preds = clf.predict(X_val_split)
+    val_f1 = f1_score(y_val_split, val_preds, average='macro')
+    
+    print(f"   [Local Validation] Macro F1 Score (on 20% holdout): {val_f1:.4f}")
+    
+    #  Cross Validation 
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     scoring = {
         'f1_macro': 'f1_macro', 'prec_macro': 'precision_macro', 'rec_macro': 'recall_macro',
@@ -194,7 +218,6 @@ for name, model in models.items():
     
     scores = cross_validate(clf, X, y, cv=cv, scoring=scoring, n_jobs=-1)
     
-    # Print Results
     print(f"--- Results for {name} ---")
     print(">> COPY THESE VALUES TO YOUR TABLE:")
     
@@ -209,11 +232,10 @@ for name, model in models.items():
     print(f"   Average-Macro (P/R/F1): {macro_p:.4f} / {macro_r:.4f} / {macro_f1:.4f}")
     
     # Final Training & Prediction
-    print(f"   Retraining {name} on full dataset...")
-    clf.fit(X, y)
+    print(f"   Retraining {name} on FULL dataset for Kaggle Submission...")
+    clf.fit(X, y) # Train on ALL data (Train + Validation) for best results
     predictions = clf.predict(X_test)
     
-    # Create submission file
     short_name = name.split('(')[1].split(')')[0].replace(" ", "")
     filename = f"kaggle_submission_{short_name}.csv"
     
@@ -225,5 +247,4 @@ for name, model in models.items():
     print(f"   Saved submission to: {filename}")
 
 print("\n" + "="*60)
-print("ALL DONE! Upload the 5 generated CSV files to Kaggle.")
-print("="*60)
+print("ALL DONE!")
