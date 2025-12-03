@@ -4,6 +4,11 @@ import sys
 if "CUDA_VISIBLE_DEVICES" not in os.environ:
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
+import warnings
+
+# --- SUPPRESS WARNINGS ---
+warnings.filterwarnings("ignore")
+
 import pandas as pd
 import numpy as np
 import re
@@ -14,7 +19,8 @@ from sklearn.preprocessing import MinMaxScaler, OneHotEncoder
 from sklearn.impute import SimpleImputer
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
-from sklearn.metrics import classification_report, f1_score # Added for detailed reporting
+from sklearn.metrics import classification_report, f1_score
+from sklearn.feature_selection import SelectKBest, chi2
 
 # Import the 5 requested models
 from sklearn.naive_bayes import MultinomialNB
@@ -22,6 +28,15 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.svm import LinearSVC 
+from sklearn.ensemble import VotingClassifier, RandomForestClassifier, StackingClassifier, GradientBoostingClassifier
+
+# Import LightGBM (The Kaggle Standard)
+try:
+    from lightgbm import LGBMClassifier
+    LIGHTGBM_AVAILABLE = True
+except ImportError:
+    LIGHTGBM_AVAILABLE = False
+    print("Warning: LightGBM not installed. 'pip install lightgbm' for better scores!")
 
 # ==========================================
 # 1. Configuration & Data Loading
@@ -29,6 +44,7 @@ from sklearn.svm import LinearSVC
 TRAIN_PATH = 'kaggle_train_dataset.csv'
 TEST_PATH = 'kaggle_test_dataset.csv'
 SUBMISSION_TEMPLATE = 'kaggle_test_submission.csv'
+VALIDATION_SPLIT_SIZE = 0.1 # 10% validation split
 
 print("Loading data...")
 
@@ -82,6 +98,24 @@ def extract_lab_value(text, lab_name):
             return np.nan
     return np.nan
 
+def count_medications(text):
+    """Counts number of medications listed in the dictionary string."""
+    if pd.isna(text): return 0
+    text = str(text)
+    return text.count(':')
+
+def clean_medical_text(text):
+    if pd.isna(text): return ""
+    text = str(text).lower()
+    # Remove units and common noisy words
+    noise = ['mg/dl', 'mmol/l', 'thous/mcl', 'mill/mcl', 'g/dl', '%', '(n)', 'result', 'name']
+    for w in noise:
+        text = text.replace(w, '')
+    # Keep (H) and (L) as they are important, maybe emphasize them
+    text = text.replace('(h)', ' high_abnormal ')
+    text = text.replace('(l)', ' low_abnormal ')
+    return text
+
 def clean_dataframe(df):
     df = df.copy()
     
@@ -99,26 +133,41 @@ def clean_dataframe(df):
 
     # 3. Elderly Flag
     df['Is_Elderly'] = (df['Age'] >= 65).astype(int)
+    df['Is_Child'] = (df['Age'] <= 12).astype(int)
 
     # 4. Extract Specific Lab Values
-    labs_to_extract = ['Creatinine', 'Glucose', 'Hemoglobin', 'Potassium', 'Sodium', 'Urea nitrogen']
+    labs_to_extract = ['Creatinine', 'Glucose', 'Hemoglobin', 'Potassium', 'Sodium', 'Urea nitrogen', 'Platelets', 'Chloride']
     for lab in labs_to_extract:
         df[f'Lab_{lab}'] = df['Lab_Values'].apply(lambda x: extract_lab_value(x, lab))
 
     # 5. Lab Abnormal Count
-    df['Lab_Abnormal_Count'] = df['Lab_Values'].astype(str).apply(lambda x: x.count('(H)') + x.count('(L)'))
+    df['Lab_High_Count'] = df['Lab_Values'].astype(str).apply(lambda x: x.count('(H)'))
+    df['Lab_Low_Count'] = df['Lab_Values'].astype(str).apply(lambda x: x.count('(L)'))
+    df['Lab_Total_Abnormal'] = df['Lab_High_Count'] + df['Lab_Low_Count']
     
-    # 6. Combined Text for TF-IDF
-    text_cols = ['Surgery_Name', 'Medication_Usage', 'Lab_Values', 'Catheter_Use']
-    for col in text_cols:
-        if col in df.columns: df[col] = df[col].fillna('')
-        else: df[col] = ''
+    # 6. Medication Count (Sicker patients take more meds)
+    df['Medication_Count'] = df['Medication_Usage'].apply(count_medications)
+
+    # 7. Emergency Surgery Flag
+    df['Is_Emergency'] = (
+        df['Surgery_Name'].astype(str).str.contains('Emergency', case=False) | 
+        df['Patient_Source'].astype(str).str.contains('Emergency', case=False)
+    ).astype(int)
     
-    df['combined_text'] = (df['Surgery_Name'] + " " + df['Medication_Usage'] + " " + 
-                           df['Lab_Values'] + " " + df['Catheter_Use'])
+    # 8. Text Preprocessing
+    # Separate Surgery Name (High Value)
+    df['text_surgery'] = df['Surgery_Name'].fillna('').apply(clean_medical_text)
+    
+    # Combined Rest (Context)
+    df['text_rest'] = (
+        df['Medication_Usage'].fillna('') + " " + 
+        df['Lab_Values'].fillna('') + " " + 
+        df['Catheter_Use'].fillna('')
+    ).apply(clean_medical_text)
+    
     return df
 
-print("Preprocessing: Extracting specific lab values and BMI...")
+print("Preprocessing: Feature Selection & Text Cleaning...")
 train_clean = clean_dataframe(train_df)
 test_clean = clean_dataframe(test_df)
 
@@ -129,11 +178,9 @@ X_test = test_clean
 # ==========================================
 # 3. SPLIT TRAINING DATA (Local Validation)
 # ==========================================
-# We split the training data 80/20.
-# 80% is used to train, 20% is used to "validate" (simulate the test).
-print("Splitting 'kaggle_train_dataset' into Training (80%) and Local Validation (20%)...")
+print(f"Splitting data ({100-int(VALIDATION_SPLIT_SIZE*100)}% Train, {int(VALIDATION_SPLIT_SIZE*100)}% Validation)...")
 X_train_split, X_val_split, y_train_split, y_val_split = train_test_split(
-    X, y, test_size=0.2, random_state=42, stratify=y
+    X, y, test_size=VALIDATION_SPLIT_SIZE, random_state=42, stratify=y
 )
 
 # ==========================================
@@ -141,44 +188,84 @@ X_train_split, X_val_split, y_train_split, y_val_split = train_test_split(
 # ==========================================
 
 numeric_features = [
-    'Age', 'HEIGHT_clean', 'WEIGHT_clean', 'BMI', 'Lab_Abnormal_Count',
+    'Age', 'HEIGHT_clean', 'WEIGHT_clean', 'BMI', 
+    'Lab_High_Count', 'Lab_Low_Count', 'Lab_Total_Abnormal', 'Medication_Count',
     'Lab_Creatinine', 'Lab_Glucose', 'Lab_Hemoglobin', 'Lab_Potassium', 'Lab_Sodium', 'Lab_Urea nitrogen'
-]
+]   
 
 numeric_transformer = Pipeline(steps=[
     ('imputer', SimpleImputer(strategy='median')),
     ('scaler', MinMaxScaler())
 ])
 
-categorical_features = ['Gender', 'ICU_Patient', 'Anesthesia_Method', 'Patient_Source', 'Is_Elderly']
+categorical_features = ['Gender', 'ICU_Patient', 'Anesthesia_Method', 'Patient_Source', 'Is_Elderly', 'Is_Child', 'Is_Emergency']
 categorical_transformer = Pipeline(steps=[
     ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
     ('onehot', OneHotEncoder(handle_unknown='ignore'))
 ])
 
-text_features = 'combined_text'
-text_transformer = Pipeline(steps=[
-    ('tfidf', TfidfVectorizer(max_features=3000, stop_words='english', ngram_range=(1,2)))
+# 1. Surgery Text: Keep top 500 best words
+surgery_features = 'text_surgery'
+surgery_transformer = Pipeline(steps=[
+    ('tfidf', TfidfVectorizer(max_features=2000, stop_words='english', ngram_range=(1, 3))),
+    ('selector', SelectKBest(chi2, k=500)) # Only keep top 500 strongest surgery terms
+])
+
+# 2. Rest Text: Keep top 500 best words
+rest_features = 'text_rest'
+rest_transformer = Pipeline(steps=[
+    ('tfidf', TfidfVectorizer(max_features=2000, stop_words='english', ngram_range=(1, 2))),
+    ('selector', SelectKBest(chi2, k=500)) # Reduce noise from labs/meds
 ])
 
 preprocessor = ColumnTransformer(
     transformers=[
         ('num', numeric_transformer, numeric_features),
         ('cat', categorical_transformer, categorical_features),
-        ('text', text_transformer, text_features)
+        ('surg_text', surgery_transformer, surgery_features),
+        ('rest_text', rest_transformer, rest_features)
     ])
 
 # ==========================================
 # 5. Models
 # ==========================================
 
+nb_model = MultinomialNB(alpha=0.001)
+lr_model = LogisticRegression(max_iter=5000, C=5.0, solver='lbfgs', class_weight='balanced')
+dt_model = DecisionTreeClassifier(max_depth=12, min_samples_leaf=20, class_weight='balanced', random_state=42)
+knn_model = KNeighborsClassifier(n_neighbors=15, weights='distance', metric='cosine')
+svm_model = LinearSVC(C=1.0, class_weight='balanced', dual=False, random_state=42, max_iter=5000)
+rf_model = RandomForestClassifier(n_estimators=200, min_samples_leaf=5, class_weight='balanced', random_state=42)
+gb_model = GradientBoostingClassifier(n_estimators=300, learning_rate=0.05, max_depth=5, random_state=42)
+lgbm_model = None
+if LIGHTGBM_AVAILABLE:
+    lgbm_model = LGBMClassifier(n_estimators=500, learning_rate=0.03, num_leaves=31, class_weight='balanced', random_state=42, verbose=-1)
+
 models = {
-    "Method #1 (Naive Bayes)": MultinomialNB(alpha=0.01),
-    "Method #2 (Logistic Regression)": LogisticRegression(max_iter=3000, C=1.5, solver='liblinear', class_weight='balanced'),
-    "Method #3 (Decision Tree)": DecisionTreeClassifier(max_depth=20, min_samples_leaf=15, class_weight='balanced', random_state=42),
-    "Method #4 (KNN)": KNeighborsClassifier(n_neighbors=19, weights='distance', metric='cosine'),
-    "Method #5 (SVM)": LinearSVC(C=0.3, class_weight='balanced', dual=False, random_state=42, max_iter=3000)
+    "Method #1 (Naive Bayes)": nb_model,
+    "Method #2 (Logistic Regression)": lr_model,
+    "Method #3 (Decision Tree)": dt_model,
+    "Method #4 (KNN)": knn_model,
+    "Method #5 (SVM)": svm_model,
+    "Method #6 (Gradient Boosting)": gb_model
 }
+if lgbm_model:
+    models["Method #7 (LightGBM)"] = lgbm_model
+
+estimators_list = [
+    ('gb', gb_model), # Added Gradient Boosting to stack
+    ('knn', knn_model),
+    ('lr', lr_model)
+]
+if lgbm_model:
+    estimators_list.append(('lgbm', lgbm_model))
+
+stacking_model = StackingClassifier(
+    estimators=estimators_list,
+    final_estimator=LogisticRegression(class_weight='balanced'),
+    cv=5
+)
+models["Method #8 (Stacking Ensemble)"] = stacking_model
 
 # ==========================================
 # 6. Training, Evaluation & Submission
@@ -237,8 +324,7 @@ for name, model in models.items():
     predictions = clf.predict(X_test)
     
     short_name = name.split('(')[1].split(')')[0].replace(" ", "")
-    filename = f"kaggle_submission_{short_name}.csv"
-    
+    filename = f"kaggle_submission_{short_name}_v4.csv"
     if len(submission_ids) != len(predictions):
         submission_ids = range(0, len(predictions))
 
