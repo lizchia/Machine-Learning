@@ -11,17 +11,18 @@ from datetime import datetime
 warnings.filterwarnings("ignore")
 
 # ==========================================
-# NEW: AUTOMATIC LOGGING TO FILE
+# LOGGING SETUP
 # ==========================================
-# This small block redirects all print() statements to both
-# the screen and a file named 'experiment_output.txt'
 class Logger(object):
     def __init__(self):
-        # Generate unique filename based on current time
-        # Format: output_YYYY-MM-DD_HH-MM-SS.txt
         self.filename = f"output_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.txt"
+        
+        directory = os.path.dirname(self.filename)
+        if directory and not os.path.exists(directory):
+            os.makedirs(directory)
+
         self.terminal = sys.stdout
-        self.log = open(self.filename, "a", encoding='utf-8') # "a" means append
+        self.log = open(self.filename, "a", encoding='utf-8')
 
     def write(self, message):
         self.terminal.write(message)
@@ -32,11 +33,11 @@ class Logger(object):
         self.terminal.flush()
         self.log.flush()
 
-# Redirect output
 sys.stdout = Logger()
 
 print("\n" + "="*60)
 print(f"EXPERIMENT RUN: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+print(f"Log file: {sys.stdout.filename}")
 print("="*60)
 
 import pandas as pd
@@ -45,47 +46,42 @@ import re
 
 from sklearn.model_selection import StratifiedKFold, cross_validate, train_test_split
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.preprocessing import MinMaxScaler, OneHotEncoder, PolynomialFeatures
+from sklearn.preprocessing import MinMaxScaler, OneHotEncoder, PolynomialFeatures, TargetEncoder
 from sklearn.impute import SimpleImputer
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
-from sklearn.metrics import classification_report, f1_score
-from sklearn.feature_selection import SelectKBest, chi2, f_classif
+from sklearn.metrics import f1_score
+from sklearn.feature_selection import SelectKBest, f_classif, chi2
 from sklearn.decomposition import TruncatedSVD
 
-# Import the 5 requested models
-from sklearn.naive_bayes import MultinomialNB
+# Import Models
 from sklearn.linear_model import LogisticRegression
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.neighbors import KNeighborsClassifier
-from sklearn.svm import LinearSVC 
-from sklearn.ensemble import VotingClassifier, RandomForestClassifier, StackingClassifier, HistGradientBoostingClassifier
+from sklearn.svm import LinearSVC
+from sklearn.ensemble import StackingClassifier, RandomForestClassifier, HistGradientBoostingClassifier
 
-# Import LightGBM (The Kaggle Standard)
 try:
     from lightgbm import LGBMClassifier
     LIGHTGBM_AVAILABLE = True
 except ImportError:
     LIGHTGBM_AVAILABLE = False
-    print("Warning: LightGBM not installed. 'pip install lightgbm' for better scores!")
+    print("Warning: LightGBM not installed.")
 
 # ==========================================
-# 1. Configuration & Data Loading
+# 1. Configuration
 # ==========================================
 TRAIN_PATH = 'kaggle_train_dataset.csv'
 TEST_PATH = 'kaggle_test_dataset.csv'
 SUBMISSION_TEMPLATE = 'kaggle_submission.csv'
-VALIDATION_SPLIT_SIZE = 0.3
-# CV Folds: How many times to cross-validate?
-# 3 = Fast (Good for testing)
-# 5 = Standard (Best for final report)
-# 10 = Very Slow (Very accurate estimation)
+
+VALIDATION_SPLIT_SIZE = 0.15
 CV_FOLDS = 10
 
+print(f"Configuration: Using {CV_FOLDS} Cross-Validation Folds.")
 print("Loading data...")
 
 def load_data_robust(filepath):
-    """Robust CSV loader."""
     encodings = ['utf-8', 'cp1252', 'latin1']
     for enc in encodings:
         try:
@@ -98,7 +94,7 @@ def load_data_robust(filepath):
 try:
     train_df = load_data_robust(TRAIN_PATH)
     test_df = load_data_robust(TEST_PATH)
-    print(f" -> Loaded {len(train_df)} training rows and {len(test_df)} test rows.")
+    print(f" -> Loaded {len(train_df)} training rows.")
 except Exception as e:
     print(f"CRITICAL ERROR: {e}")
     sys.exit(1)
@@ -123,7 +119,6 @@ def parse_height(height_str):
         return np.nan
 
 def extract_lab_value(text, lab_name):
-    """Regex to find specific lab number (e.g. 'Creatinine: 0.5')"""
     if pd.isna(text): return np.nan
     pattern = re.compile(re.escape(lab_name) + r"[:\s]+([\d\.]+)", re.IGNORECASE)
     match = pattern.search(str(text))
@@ -135,56 +130,43 @@ def extract_lab_value(text, lab_name):
     return np.nan
 
 def count_medications(text):
-    """Counts number of medications listed in the dictionary string."""
     if pd.isna(text): return 0
-    text = str(text)
-    return text.count(':')
+    return str(text).count(':')
 
 def clean_medical_text(text):
     if pd.isna(text): return ""
     text = str(text).lower()
-    # Remove units and common noisy words
     noise = ['mg/dl', 'mmol/l', 'thous/mcl', 'mill/mcl', 'g/dl', '%', '(n)', 'result', 'name']
     for w in noise:
         text = text.replace(w, '')
-    # Keep (H) and (L) as they are important, maybe emphasize them
     text = text.replace('(h)', ' high_abnormal ')
     text = text.replace('(l)', ' low_abnormal ')
     return text
 
 def calculate_comorbidity_score(row):
-    """
-    Scans all text fields for specific high-risk disease keywords.
-    Each hit increases the 'sickness score'.
-    """
-    # Combine relevant text columns
     full_text = str(row.get('Surgery_Name', '')) + " " + \
                 str(row.get('Medication_Usage', '')) + " " + \
                 str(row.get('Patient_Source', ''))
     full_text = full_text.lower()
     
-    # Dictionary of keyword -> severity score (The "Domain Knowledge")
     risk_dict = {
         # === CRITICAL / EMERGENCY (Score 4) ===
         'sepsis': 4, 'septic': 4, 'shock': 4, 'rupture': 4, 
         'transplant': 4, 'craniotomy': 4, 'aneurysm': 4,
         'intracranial': 4, 'bleed': 4,
-        
         # === SEVERE CHRONIC (Score 3) ===
-        'dialysis': 3, 'esrd': 3, 'failure': 3, # Organ failure
-        'chf': 3, 'congestive': 3, 'cabg': 3, 'valve': 3, # Heart
-        'metastasis': 3, 'malignancy': 3, 'chemo': 3, 'radiation': 3, # Active Cancer
-        'cirrhosis': 3, 'ascites': 3, # Liver
-        'stroke': 3, 'cva': 3, 'paralysis': 3, # Neuro
-        
+        'dialysis': 3, 'esrd': 3, 'failure': 3, 
+        'chf': 3, 'congestive': 3, 'cabg': 3, 'valve': 3, 
+        'metastasis': 3, 'malignancy': 3, 'chemo': 3, 'radiation': 3,
+        'cirrhosis': 3, 'ascites': 3,
+        'stroke': 3, 'cva': 3, 'paralysis': 3,
         # === MODERATE (Score 2) ===
         'cancer': 2, 'tumor': 2, 'mass': 2,
-        'copd': 2, 'asthma': 2, 'pulmonary': 2, 'pneumonia': 2, # Lungs
-        'diabetes': 2, 'insulin': 2, 'dm': 2, 'ketoacidosis': 2, # Metabolic
-        'angina': 2, 'cad': 2, 'arrhythmia': 2, 'pacemaker': 2, # Heart
+        'copd': 2, 'asthma': 2, 'pulmonary': 2, 'pneumonia': 2,
+        'diabetes': 2, 'insulin': 2, 'dm': 2, 'ketoacidosis': 2,
+        'angina': 2, 'cad': 2, 'arrhythmia': 2, 'pacemaker': 2,
         'kidney': 2, 'renal': 2,
-        
-        # === MILD / COMMON (Score 1) ===
+        # === MILD (Score 1) ===
         'hypertension': 1, 'htn': 1, 'pressure': 1,
         'obesity': 1, 'bmi': 1, 'apnea': 1, 
         'gerd': 1, 'reflux': 1, 'anemia': 1,
@@ -192,60 +174,46 @@ def calculate_comorbidity_score(row):
     }
     
     score = 0
-    # We sum up the points for every keyword found
     for word, points in risk_dict.items():
         if word in full_text:
             score += points
-            
     return score
 
 def clean_dataframe(df):
     df = df.copy()
     
-    # 1. Basic Cleaning
     if 'HEIGHT' in df.columns:
         df['HEIGHT_clean'] = df['HEIGHT'].apply(parse_height)
     else:
         df['HEIGHT_clean'] = np.nan
     df['WEIGHT_clean'] = pd.to_numeric(df['WEIGHT'], errors='coerce')
     
-    # 2. BMI Calculation
     height_m = df['HEIGHT_clean'] * 0.0254
     df['BMI'] = df['WEIGHT_clean'] / (height_m ** 2)
     df['BMI'] = df['BMI'].replace([np.inf, -np.inf], np.nan)
 
-    # 3. Elderly Flag
     df['Is_Elderly'] = (df['Age'] >= 65).astype(int)
     df['Is_Child'] = (df['Age'] <= 12).astype(int)
 
-    # 4. Extract Specific Lab Values
     labs_to_extract = ['Creatinine', 'Glucose', 'Hemoglobin', 'Potassium', 'Sodium', 'Urea nitrogen', 'Platelets', 'Chloride']
     for lab in labs_to_extract:
         df[f'Lab_{lab}'] = df['Lab_Values'].apply(lambda x: extract_lab_value(x, lab))
-
-    # 5. Lab Abnormal Count
+        
     df['Lab_BUN_Creatinine_Ratio'] = df['Lab_Urea nitrogen'] / df['Lab_Creatinine'].replace(0, np.nan)
+
     df['Lab_High_Count'] = df['Lab_Values'].astype(str).apply(lambda x: x.count('(H)'))
     df['Lab_Low_Count'] = df['Lab_Values'].astype(str).apply(lambda x: x.count('(L)'))
     df['Lab_Total_Abnormal'] = df['Lab_High_Count'] + df['Lab_Low_Count']
-    
-    # Comorbidity Score
+
+    df['Medication_Count'] = df['Medication_Usage'].apply(count_medications)
     df['Comorbidity_Score'] = df.apply(calculate_comorbidity_score, axis=1)
 
-    # 6. Medication Count (Sicker patients take more meds)
-    df['Medication_Count'] = df['Medication_Usage'].apply(count_medications)
-
-    # 7. Emergency Surgery Flag
     df['Is_Emergency'] = (
         df['Surgery_Name'].astype(str).str.contains('Emergency', case=False) | 
         df['Patient_Source'].astype(str).str.contains('Emergency', case=False)
     ).astype(int)
     
-    # 8. Text Preprocessing
-    # Separate Surgery Name (High Value)
     df['text_surgery'] = df['Surgery_Name'].fillna('').apply(clean_medical_text)
-    
-    # Combined Rest (Context)
     df['text_rest'] = (
         df['Medication_Usage'].fillna('') + " " + 
         df['Lab_Values'].fillna('') + " " + 
@@ -254,7 +222,7 @@ def clean_dataframe(df):
     
     return df
 
-print("Preprocessing: Feature Selection & Text Cleaning...")
+print("Preprocessing: Target Encoding, SVD & Comorbidity Scoring...")
 train_clean = clean_dataframe(train_df)
 test_clean = clean_dataframe(test_df)
 
@@ -263,9 +231,8 @@ y = train_clean['ASA_Rating']
 X_test = test_clean
 
 # ==========================================
-# 3. SPLIT TRAINING DATA (Local Validation)
+# 3. SPLIT TRAINING DATA (90/10)
 # ==========================================
-print(f"Splitting data ({100-int(VALIDATION_SPLIT_SIZE*100)}% Train, {int(VALIDATION_SPLIT_SIZE*100)}% Validation)...")
 X_train_split, X_val_split, y_train_split, y_val_split = train_test_split(
     X, y, test_size=VALIDATION_SPLIT_SIZE, random_state=42, stratify=y
 )
@@ -276,13 +243,14 @@ X_train_split, X_val_split, y_train_split, y_val_split = train_test_split(
 
 numeric_features = [
     'Age', 'HEIGHT_clean', 'WEIGHT_clean', 'BMI', 
-    'Lab_High_Count', 'Lab_Low_Count', 'Lab_Total_Abnormal', 'Medication_Count',
-    'Lab_Creatinine', 'Lab_Glucose', 'Lab_Hemoglobin', 'Lab_Potassium', 'Lab_Sodium', 'Lab_Urea nitrogen', 'Lab_BUN_Creatinine_Ratio', 'Comorbidity_Score'
-]   
+    'Lab_High_Count', 'Lab_Low_Count', 'Lab_Total_Abnormal', 'Medication_Count', 'Comorbidity_Score',
+    'Lab_Creatinine', 'Lab_Glucose', 'Lab_Hemoglobin', 'Lab_Potassium', 'Lab_Sodium', 'Lab_Urea nitrogen',
+    'Lab_BUN_Creatinine_Ratio'
+]
 
 numeric_transformer = Pipeline(steps=[
     ('imputer', SimpleImputer(strategy='median')),
-    ('poly', PolynomialFeatures(degree=2, include_bias=False, interaction_only=True)), # Age * BMI
+    ('poly', PolynomialFeatures(degree=2, include_bias=False, interaction_only=True)), 
     ('scaler', MinMaxScaler()),
     ('selector', SelectKBest(f_classif, k=50))
 ])
@@ -293,24 +261,34 @@ categorical_transformer = Pipeline(steps=[
     ('onehot', OneHotEncoder(handle_unknown='ignore'))
 ])
 
-# 1. Surgery Text
+# NEW: Target Encoded Features (Risk Scores)
+# We treat Surgery Name and Anesthesia as categories to find their average risk
+target_cat_features = ['text_surgery', 'Anesthesia_Method', 'Patient_Source']
+target_transformer = Pipeline(steps=[
+    # TargetEncoder uses the 'y' labels to calculate average risk per category
+    # smooth='auto' prevents overfitting on rare surgeries
+    ('encoder', TargetEncoder(smooth='auto', target_type='continuous')),
+    ('imputer', SimpleImputer(strategy='median')),
+    ('scaler', MinMaxScaler())
+])
+
 surgery_features = 'text_surgery'
 surgery_transformer = Pipeline(steps=[
     ('tfidf', TfidfVectorizer(max_features=2000, stop_words='english', ngram_range=(1, 3))),
-    ('svd', TruncatedSVD(n_components=50, random_state=42)) # Compress to 50 topics
+    ('svd', TruncatedSVD(n_components=50, random_state=42))
 ])
 
-# 2. Rest Text
 rest_features = 'text_rest'
 rest_transformer = Pipeline(steps=[
     ('tfidf', TfidfVectorizer(max_features=2000, stop_words='english', ngram_range=(1, 2))),
-    ('svd', TruncatedSVD(n_components=50, random_state=42)) # Reduce noise from labs/meds
+    ('svd', TruncatedSVD(n_components=50, random_state=42))
 ])
 
 preprocessor = ColumnTransformer(
     transformers=[
         ('num', numeric_transformer, numeric_features),
         ('cat', categorical_transformer, categorical_features),
+        ('target', target_transformer, target_cat_features), # <--- NEW
         ('surg_text', surgery_transformer, surgery_features),
         ('rest_text', rest_transformer, rest_features)
     ])
@@ -337,7 +315,10 @@ rf_model = RandomForestClassifier(n_estimators=300, min_samples_leaf=5, class_we
 
 lgbm_model = None
 if LIGHTGBM_AVAILABLE:
-    lgbm_model = LGBMClassifier(n_estimators=300, learning_rate=0.05, num_leaves=40, class_weight='balanced', random_state=42, verbose=-1, n_jobs=-1)
+    # OPTIMIZED: Increased learning_rate to 0.05 (faster convergence)
+    # Decreased n_estimators to 300 (faster training)
+    # n_jobs=-1 allows it to use ALL cores when running standalone
+    lgbm_model = LGBMClassifier(n_estimators=300, learning_rate=0.05, num_leaves=31, class_weight='balanced', random_state=42, verbose=-1, n_jobs=-1)
 
 models = {
     "Method #1 (Logistic Regression)": lr_model,
@@ -349,29 +330,31 @@ models = {
 if lgbm_model:
     models["Method #6 (LightGBM)"] = lgbm_model
 
-# --- NEW CONFIGURATION REQUESTED BY USER ---
+# Diversity Stack
 estimators_list = [
-    ('knn', knn_model), # User mapped 'gb' to knn_model, so we use 'knn' label for clarity
+    ('knn', knn_model),
     ('svm', svm_model),
     ('rf', rf_model)
 ]
 if lgbm_model:
     estimators_list.append(('lgbm', lgbm_model))
+else:
+    estimators_list.append(('hgb', gb_model))
 
 stacking_model = StackingClassifier(
     estimators=estimators_list,
     final_estimator=LogisticRegression(class_weight='balanced'),
-    cv=3,
-    n_jobs=1
+    cv=3,       # OPTIMIZED: Reduce internal CV to 3 (Speed up Stacking)
+    n_jobs=1    # OPTIMIZED: Process folds sequentially to avoid CPU contention with LightGBM
 )
-# models["Method #7 (Stacking Ensemble)"] = stacking_model
+models["Method #7 (Stacking Ensemble)"] = stacking_model
+
 
 # ==========================================
-# 6. Training, Evaluation & Submission
+# 6. Training & Execution
 # ==========================================
 
-print("\n" + "="*60)
-print("STARTING EXPERIMENTS WITH VALIDATION SPLIT")
+print(f"STARTING EXPERIMENTS (CV Folds: {CV_FOLDS})")
 print("="*60)
 
 submission_ids = None
@@ -388,7 +371,7 @@ for name, model in models.items():
     
     clf = Pipeline(steps=[('preprocessor', preprocessor), ('classifier', model)])
     
-    #  Local Validation Split
+    # A. Local Validation
     clf.fit(X_train_split, y_train_split)
     val_preds = clf.predict(X_val_split)
     val_f1 = f1_score(y_val_split, val_preds, average='macro')
@@ -402,8 +385,11 @@ for name, model in models.items():
         'f1_micro': 'f1_micro', 'prec_micro': 'precision_micro', 'rec_micro': 'recall_micro'
     }
     
-    scores = cross_validate(clf, X, y, cv=cv, scoring=scoring, n_jobs=-1)
-    
+    try:
+        scores = cross_validate(clf, X, y, cv=cv, scoring=scoring, n_jobs=-1)
+    except:
+         scores = cross_validate(clf, X, y, cv=cv, scoring=scoring, n_jobs=1)
+
     print(f"--- Results for {name} ---")
     print(">> COPY THESE VALUES TO YOUR TABLE:")
     
@@ -416,10 +402,10 @@ for name, model in models.items():
     macro_r = np.mean(scores['test_rec_macro'])
     macro_f1 = np.mean(scores['test_f1_macro'])
     print(f"   Average-Macro (P/R/F1): {macro_p:.4f} / {macro_r:.4f} / {macro_f1:.4f}")
-    
-    # Final Training & Prediction
-    print(f"   Retraining {name} on FULL dataset for Kaggle Submission...")
-    clf.fit(X, y) # Train on ALL data (Train + Validation) for best results
+
+    # C. Submission File
+    print(f"   Retraining on FULL dataset...")
+    clf.fit(X, y) 
     predictions = clf.predict(X_test)
     
     short_name = name.split('(')[1].split(')')[0].replace(" ", "")
@@ -429,7 +415,7 @@ for name, model in models.items():
 
     submission_df = pd.DataFrame({'Id': submission_ids, 'ASA_Rating': predictions})
     submission_df.to_csv(filename, index=False)
-    print(f"   Saved submission to: {filename}")
+    print(f"   Saved: {filename}")
 
 print("\n" + "="*60)
 print(f"ALL DONE! Output recorded in 'output_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.txt'.")
