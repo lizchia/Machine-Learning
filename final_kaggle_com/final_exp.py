@@ -43,8 +43,10 @@ print("="*60)
 import pandas as pd
 import numpy as np
 import re
+from sklearn.experimental import enable_iterative_imputer
+from sklearn.impute import IterativeImputer # Smarter than SimpleImputer
 
-from sklearn.model_selection import StratifiedKFold, cross_validate, train_test_split
+from sklearn.model_selection import StratifiedKFold, cross_validate, train_test_split, GridSearchCV, RandomizedSearchCV
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import MinMaxScaler, OneHotEncoder, PolynomialFeatures, TargetEncoder
 from sklearn.impute import SimpleImputer
@@ -53,13 +55,14 @@ from sklearn.pipeline import Pipeline
 from sklearn.metrics import f1_score
 from sklearn.feature_selection import SelectKBest, f_classif, chi2
 from sklearn.decomposition import TruncatedSVD
+from sklearn.linear_model import Ridge
 
 # Import Models
 from sklearn.linear_model import LogisticRegression
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.neighbors import KNeighborsClassifier
-from sklearn.svm import LinearSVC
-from sklearn.ensemble import StackingClassifier, RandomForestClassifier, HistGradientBoostingClassifier
+from sklearn.svm import LinearSVC, SVC
+from sklearn.ensemble import StackingClassifier, RandomForestClassifier, HistGradientBoostingClassifier, VotingClassifier, AdaBoostClassifier
 
 try:
     from lightgbm import LGBMClassifier
@@ -75,7 +78,7 @@ TRAIN_PATH = 'kaggle_train_dataset.csv'
 TEST_PATH = 'kaggle_test_dataset.csv'
 SUBMISSION_TEMPLATE = 'kaggle_submission.csv'
 
-VALIDATION_SPLIT_SIZE = 0.15
+VALIDATION_SPLIT_SIZE = 0.1 
 CV_FOLDS = 10
 
 print(f"Configuration: Using {CV_FOLDS} Cross-Validation Folds.")
@@ -143,6 +146,50 @@ def clean_medical_text(text):
     text = text.replace('(l)', ' low_abnormal ')
     return text
 
+def add_specific_disease_flags(df):
+    full_text = (
+        df['Surgery_Name'].fillna('') + " " + 
+        df['Medication_Usage'].fillna('') + " " + 
+        df['Patient_Source'].fillna('')
+    ).str.lower()
+    
+    renal_keywords = ['kidney', 'renal', 'dialysis', 'creatinine', 'nephro']
+    df['Is_Renal'] = full_text.apply(lambda x: 1 if any(k in x for k in renal_keywords) else 0)
+    
+    cardiac_keywords = ['heart', 'cardiac', 'valve', 'aortic', 'mitral', 'cabg', 'chf', 'failure', 'angina', 'htn', 'hypertension']
+    df['Is_Cardiac'] = full_text.apply(lambda x: 1 if any(k in x for k in cardiac_keywords) else 0)
+    
+    neuro_keywords = ['brain', 'neuro', 'stroke', 'cva', 'cranio', 'intracranial']
+    df['Is_Neuro'] = full_text.apply(lambda x: 1 if any(k in x for k in neuro_keywords) else 0)
+    
+    resp_keywords = ['lung', 'pulmonary', 'copd', 'asthma', 'pneumonia', 'respiratory']
+    df['Is_Respiratory'] = full_text.apply(lambda x: 1 if any(k in x for k in resp_keywords) else 0)
+    
+    cancer_keywords = ['cancer', 'tumor', 'malignancy', 'metastasis', 'chemo', 'radiation', 'mass']
+    df['Is_Cancer'] = full_text.apply(lambda x: 1 if any(k in x for k in cancer_keywords) else 0)
+    
+    return df
+
+# --- NEW: Critical Device Detection ---
+def add_critical_device_flags(df):
+    """
+    Checks Catheter_Use and properties_display for high-risk invasive devices.
+    """
+    full_text = (
+        df['Catheter_Use'].fillna('') + " " + 
+        df['properties_display'].fillna('')
+    ).str.lower()
+    
+    # 1. Invasive Monitoring (A-line, CVC, PA Catheter) -> High Risk
+    invasive_keywords = ['arterial', 'a-line', 'cvc', 'central', 'picc', 'swan', 'pa catheter', 'pulmonary artery']
+    df['Has_Invasive_Monitor'] = full_text.apply(lambda x: 1 if any(k in x for k in invasive_keywords) else 0)
+    
+    # 2. Airway Support (Ventilator, ET Tube) -> High Risk
+    airway_keywords = ['vent', 'intubat', 'et tube', 'endotracheal', 'trach']
+    df['Has_Airway_Support'] = full_text.apply(lambda x: 1 if any(k in x for k in airway_keywords) else 0)
+    
+    return df
+
 def calculate_comorbidity_score(row):
     full_text = str(row.get('Surgery_Name', '')) + " " + \
                 str(row.get('Medication_Usage', '')) + " " + \
@@ -150,23 +197,19 @@ def calculate_comorbidity_score(row):
     full_text = full_text.lower()
     
     risk_dict = {
-        # === CRITICAL / EMERGENCY (Score 4) ===
         'sepsis': 4, 'septic': 4, 'shock': 4, 'rupture': 4, 
         'transplant': 4, 'craniotomy': 4, 'aneurysm': 4,
         'intracranial': 4, 'bleed': 4,
-        # === SEVERE CHRONIC (Score 3) ===
         'dialysis': 3, 'esrd': 3, 'failure': 3, 
         'chf': 3, 'congestive': 3, 'cabg': 3, 'valve': 3, 
         'metastasis': 3, 'malignancy': 3, 'chemo': 3, 'radiation': 3,
         'cirrhosis': 3, 'ascites': 3,
         'stroke': 3, 'cva': 3, 'paralysis': 3,
-        # === MODERATE (Score 2) ===
         'cancer': 2, 'tumor': 2, 'mass': 2,
         'copd': 2, 'asthma': 2, 'pulmonary': 2, 'pneumonia': 2,
         'diabetes': 2, 'insulin': 2, 'dm': 2, 'ketoacidosis': 2,
         'angina': 2, 'cad': 2, 'arrhythmia': 2, 'pacemaker': 2,
         'kidney': 2, 'renal': 2,
-        # === MILD (Score 1) ===
         'hypertension': 1, 'htn': 1, 'pressure': 1,
         'obesity': 1, 'bmi': 1, 'apnea': 1, 
         'gerd': 1, 'reflux': 1, 'anemia': 1,
@@ -207,6 +250,13 @@ def clean_dataframe(df):
 
     df['Medication_Count'] = df['Medication_Usage'].apply(count_medications)
     df['Comorbidity_Score'] = df.apply(calculate_comorbidity_score, axis=1)
+    
+    df = add_specific_disease_flags(df)
+    
+    # NEW: Critical Devices
+    df = add_critical_device_flags(df)
+    
+    df['Age_x_Comorbidity'] = df['Age'] * df['Comorbidity_Score']
 
     df['Is_Emergency'] = (
         df['Surgery_Name'].astype(str).str.contains('Emergency', case=False) | 
@@ -222,7 +272,7 @@ def clean_dataframe(df):
     
     return df
 
-print("Preprocessing: Target Encoding, SVD & Comorbidity Scoring...")
+print("Preprocessing: ...")
 train_clean = clean_dataframe(train_df)
 test_clean = clean_dataframe(test_df)
 
@@ -243,30 +293,30 @@ X_train_split, X_val_split, y_train_split, y_val_split = train_test_split(
 
 numeric_features = [
     'Age', 'HEIGHT_clean', 'WEIGHT_clean', 'BMI', 
-    'Lab_High_Count', 'Lab_Low_Count', 'Lab_Total_Abnormal', 'Medication_Count', 'Comorbidity_Score',
+    'Lab_High_Count', 'Lab_Low_Count', 'Lab_Total_Abnormal', 'Medication_Count', 
+    'Comorbidity_Score', 'Age_x_Comorbidity',
+    'Is_Renal', 'Is_Cardiac', 'Is_Neuro', 'Is_Respiratory', 'Is_Cancer',
+    'Has_Invasive_Monitor', 'Has_Airway_Support', # <--- NEW FEATURES
     'Lab_Creatinine', 'Lab_Glucose', 'Lab_Hemoglobin', 'Lab_Potassium', 'Lab_Sodium', 'Lab_Urea nitrogen',
     'Lab_BUN_Creatinine_Ratio'
 ]
 
+# OPTIMIZED: Use IterativeImputer (MICE) instead of SimpleImputer
 numeric_transformer = Pipeline(steps=[
-    ('imputer', SimpleImputer(strategy='median')),
+    ('imputer', IterativeImputer(max_iter=10, random_state=42)), # Smarter filling
     ('poly', PolynomialFeatures(degree=2, include_bias=False, interaction_only=True)), 
     ('scaler', MinMaxScaler()),
-    ('selector', SelectKBest(f_classif, k=50))
+    ('selector', SelectKBest(f_classif, k=60))
 ])
 
-categorical_features = ['Gender', 'ICU_Patient', 'Anesthesia_Method', 'Patient_Source', 'Is_Elderly', 'Is_Child', 'Is_Emergency']
+categorical_features = ['Gender', 'ICU_Patient', 'Is_Elderly', 'Is_Child', 'Is_Emergency']
 categorical_transformer = Pipeline(steps=[
     ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
     ('onehot', OneHotEncoder(handle_unknown='ignore'))
 ])
 
-# NEW: Target Encoded Features (Risk Scores)
-# We treat Surgery Name and Anesthesia as categories to find their average risk
 target_cat_features = ['text_surgery', 'Anesthesia_Method', 'Patient_Source']
 target_transformer = Pipeline(steps=[
-    # TargetEncoder uses the 'y' labels to calculate average risk per category
-    # smooth='auto' prevents overfitting on rare surgeries
     ('encoder', TargetEncoder(smooth='auto', target_type='continuous')),
     ('imputer', SimpleImputer(strategy='median')),
     ('scaler', MinMaxScaler())
@@ -274,8 +324,8 @@ target_transformer = Pipeline(steps=[
 
 surgery_features = 'text_surgery'
 surgery_transformer = Pipeline(steps=[
-    ('tfidf', TfidfVectorizer(max_features=2000, stop_words='english', ngram_range=(1, 3))),
-    ('svd', TruncatedSVD(n_components=50, random_state=42))
+    ('tfidf', TfidfVectorizer(max_features=3000, stop_words='english', ngram_range=(1, 3))),
+    ('svd', TruncatedSVD(n_components=100, random_state=42))
 ])
 
 rest_features = 'text_rest'
@@ -288,7 +338,7 @@ preprocessor = ColumnTransformer(
     transformers=[
         ('num', numeric_transformer, numeric_features),
         ('cat', categorical_transformer, categorical_features),
-        ('target', target_transformer, target_cat_features), # <--- NEW
+        ('target', target_transformer, target_cat_features), 
         ('surg_text', surgery_transformer, surgery_features),
         ('rest_text', rest_transformer, rest_features)
     ])
@@ -300,55 +350,70 @@ preprocessor = ColumnTransformer(
 lr_model = LogisticRegression(max_iter=5000, C=1.0, solver='lbfgs', class_weight='balanced')
 dt_model = DecisionTreeClassifier(max_depth=10, min_samples_leaf=30, class_weight='balanced', random_state=42)
 knn_model = KNeighborsClassifier(n_neighbors=25, weights='distance', metric='cosine')
-svm_model = LinearSVC(C=0.5, class_weight='balanced', dual=False, random_state=42, max_iter=5000)
+svm_model = SVC(C=0.5, class_weight='balanced', kernel='linear', probability=True, random_state=42)
+ada_model = AdaBoostClassifier(n_estimators=100, learning_rate=0.1, random_state=42)
 
-gb_model = HistGradientBoostingClassifier(
-    max_iter=500,
-    learning_rate=0.03,
-    max_depth=10,
-    class_weight='balanced',
-    random_state=42,
-    early_stopping=True
-)
+# --- 1. Tune Random Forest ---
+print("   [Auto-Tuning] Tuning Random Forest...")
+rf_base = RandomForestClassifier(class_weight='balanced', random_state=42, n_jobs=-1)
+rf_param_dist = {
+    'classifier__n_estimators': [200, 300],
+    'classifier__max_depth': [10, 20, None],
+    'classifier__min_samples_split': [5, 10]
+}
+rf_pipeline = Pipeline(steps=[('preprocessor', preprocessor), ('classifier', rf_base)])
+rf_search = RandomizedSearchCV(estimator=rf_pipeline, param_distributions=rf_param_dist, n_iter=5, scoring='f1_macro', cv=3, n_jobs=1, verbose=1, random_state=42)
+rf_search.fit(X_train_split, y_train_split)
+rf_best_model = rf_search.best_estimator_.named_steps['classifier']
 
-rf_model = RandomForestClassifier(n_estimators=300, min_samples_leaf=5, class_weight='balanced', random_state=42, n_jobs=-1)
+# --- 2. Tune HistGradientBoosting (NEW) ---
+print("   [Auto-Tuning] Tuning HistGradientBoosting...")
+gb_base = HistGradientBoostingClassifier(class_weight='balanced', random_state=42, early_stopping=True)
+gb_param_dist = {
+    'classifier__learning_rate': [0.01, 0.05, 0.1],
+    'classifier__max_depth': [5, 10, 15],
+    'classifier__max_iter': [200, 500],
+    'classifier__l2_regularization': [0, 0.1, 1.0]
+}
+gb_pipeline = Pipeline(steps=[('preprocessor', preprocessor), ('classifier', gb_base)])
+gb_search = RandomizedSearchCV(estimator=gb_pipeline, param_distributions=gb_param_dist, n_iter=5, scoring='f1_macro', cv=3, n_jobs=1, verbose=1, random_state=42)
+gb_search.fit(X_train_split, y_train_split)
+gb_best_model = gb_search.best_estimator_.named_steps['classifier']
 
 lgbm_model = None
 if LIGHTGBM_AVAILABLE:
-    # OPTIMIZED: Increased learning_rate to 0.05 (faster convergence)
-    # Decreased n_estimators to 300 (faster training)
-    # n_jobs=-1 allows it to use ALL cores when running standalone
     lgbm_model = LGBMClassifier(n_estimators=300, learning_rate=0.05, num_leaves=31, class_weight='balanced', random_state=42, verbose=-1, n_jobs=-1)
 
 models = {
     "Method #1 (Logistic Regression)": lr_model,
     "Method #2 (Decision Tree)": dt_model,
-    "Method #3 (KNN - SVD Enhanced)": knn_model,
-    "Method #4 (SVM - SVD Enhanced)": svm_model,
-    "Method #5 (HistGradientBoosting)": gb_model
+    "Method #3 (KNN)": knn_model,
+    "Method #4 (SVM)": svm_model,
+    "Method #5 (HistGradientBoosting - Tuned)": gb_best_model,
+    "Method #6 (AdaBoost)": ada_model
 }
 if lgbm_model:
-    models["Method #6 (LightGBM)"] = lgbm_model
+    models["Method #7 (LightGBM)"] = lgbm_model
 
-# Diversity Stack
-estimators_list = [
-    ('knn', knn_model),
-    ('svm', svm_model),
-    ('rf', rf_model)
-]
-if lgbm_model:
-    estimators_list.append(('lgbm', lgbm_model))
-else:
-    estimators_list.append(('hgb', gb_model))
+# --- STRATEGY: BLENDING ---
+estimators_list = [('knn', knn_model), ('svm', svm_model), ('rf', rf_best_model), ('ada', ada_model)]
+if lgbm_model: estimators_list.append(('lgbm', lgbm_model))
+else: estimators_list.append(('hgb', gb_best_model))
 
+# Using a robust Meta-Learner
 stacking_model = StackingClassifier(
     estimators=estimators_list,
-    final_estimator=LogisticRegression(class_weight='balanced'),
-    cv=3,       # OPTIMIZED: Reduce internal CV to 3 (Speed up Stacking)
-    n_jobs=1    # OPTIMIZED: Process folds sequentially to avoid CPU contention with LightGBM
+    final_estimator=RandomForestClassifier(n_estimators=100, max_depth=5, class_weight='balanced', random_state=42),
+    cv=3, n_jobs=1    
 )
-models["Method #7 (Stacking Ensemble)"] = stacking_model
+models["Method #8 (Stacking Ensemble)"] = stacking_model
 
+voting_model = VotingClassifier(
+    estimators=estimators_list,
+    voting='soft',
+    n_jobs=1
+)
+models["Method #9 (Voting Classifier)"] = voting_model
 
 # ==========================================
 # 6. Training & Execution
@@ -366,13 +431,33 @@ if os.path.exists(SUBMISSION_TEMPLATE):
 if submission_ids is None:
     submission_ids = range(0, len(test_clean))
 
+best_stacking_pipeline = None
+best_voting_pipeline = None
+
 for name, model in models.items():
     print(f"\nRunning {name}...")
     
     clf = Pipeline(steps=[('preprocessor', preprocessor), ('classifier', model)])
     
     # A. Local Validation
-    clf.fit(X_train_split, y_train_split)
+    try:
+        clf.fit(X_train_split, y_train_split)
+        if "Stacking" in name: best_stacking_pipeline = clf
+        if "Voting" in name: best_voting_pipeline = clf
+    except TypeError as e:
+        preprocessor_dense = ColumnTransformer(
+            transformers=[
+                ('num', numeric_transformer, numeric_features),
+                ('cat', categorical_transformer, categorical_features),
+                ('target', target_transformer, target_cat_features),
+                ('surg_text', surgery_transformer, surgery_features),
+                ('rest_text', rest_transformer, rest_features)
+            ], sparse_threshold=0)
+        clf = Pipeline(steps=[('preprocessor', preprocessor_dense), ('classifier', model)])
+        clf.fit(X_train_split, y_train_split)
+        if "Stacking" in name: best_stacking_pipeline = clf
+        if "Voting" in name: best_voting_pipeline = clf
+
     val_preds = clf.predict(X_val_split)
     val_f1 = f1_score(y_val_split, val_preds, average='macro')
     
@@ -391,8 +476,6 @@ for name, model in models.items():
          scores = cross_validate(clf, X, y, cv=cv, scoring=scoring, n_jobs=1)
 
     print(f"--- Results for {name} ---")
-    print(">> COPY THESE VALUES TO YOUR TABLE:")
-    
     micro_p = np.mean(scores['test_prec_micro'])
     micro_r = np.mean(scores['test_rec_micro'])
     micro_f1 = np.mean(scores['test_f1_micro'])
@@ -416,6 +499,31 @@ for name, model in models.items():
     submission_df = pd.DataFrame({'Id': submission_ids, 'ASA_Rating': predictions})
     submission_df.to_csv(filename, index=False)
     print(f"   Saved: {filename}")
+
+# ==========================================
+# 7. FINAL BLENDING (Stacking + Voting)
+# ==========================================
+print("\n" + "="*60)
+print("RUNNING FINAL BLENDING (Stacking + Voting)")
+print("="*60)
+
+if best_stacking_pipeline and best_voting_pipeline:
+    
+    print("   Predicting Probabilities with Stacking Model...")
+    probs_stack = best_stacking_pipeline.predict_proba(X_test)
+    
+    print("   Predicting Probabilities with Voting Model...")
+    probs_vote = best_voting_pipeline.predict_proba(X_test)
+    
+    # Weighted Average (60% Stacking, 40% Voting)
+    final_probs = (0.6 * probs_stack) + (0.4 * probs_vote)
+    
+    final_preds = np.argmax(final_probs, axis=1) + 1
+    
+    filename = "kaggle_submission_FinalBlending.csv"
+    submission_df = pd.DataFrame({'Id': submission_ids, 'ASA_Rating': final_preds})
+    submission_df.to_csv(filename, index=False)
+    print(f"   Saved Blended Submission: {filename}")
 
 print("\n" + "="*60)
 print(f"ALL DONE! Output recorded in 'output_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.txt'.")
