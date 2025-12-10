@@ -1,10 +1,10 @@
+import pandas as pd
+import numpy as np
+import re
 import os
 import sys
-
-if "CUDA_VISIBLE_DEVICES" not in os.environ:
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-
 import warnings
+import csv
 from datetime import datetime
 
 # --- SUPPRESS WARNINGS ---
@@ -36,19 +36,17 @@ class Logger(object):
 sys.stdout = Logger()
 
 print("\n" + "="*60)
-print(f"EXPERIMENT RUN: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+print(f"NEW EXPERIMENT RUN: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 print(f"Log file: {sys.stdout.filename}")
 print("="*60)
 
-import pandas as pd
-import numpy as np
-import re
+# --- NEW IMPORTS ---
 from sklearn.experimental import enable_iterative_imputer
-from sklearn.impute import IterativeImputer # Smarter than SimpleImputer
+from sklearn.impute import IterativeImputer 
 
 from sklearn.model_selection import StratifiedKFold, cross_validate, train_test_split, GridSearchCV, RandomizedSearchCV
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.preprocessing import MinMaxScaler, OneHotEncoder, PolynomialFeatures, TargetEncoder
+from sklearn.preprocessing import MinMaxScaler, OneHotEncoder, PolynomialFeatures, TargetEncoder, StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
@@ -62,6 +60,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.svm import LinearSVC, SVC
+# NEW: Neural Network (MLP)
+from sklearn.neural_network import MLPClassifier
 from sklearn.ensemble import StackingClassifier, RandomForestClassifier, HistGradientBoostingClassifier, VotingClassifier, AdaBoostClassifier
 
 try:
@@ -76,7 +76,7 @@ except ImportError:
 # ==========================================
 TRAIN_PATH = 'kaggle_train_dataset.csv'
 TEST_PATH = 'kaggle_test_dataset.csv'
-SUBMISSION_TEMPLATE = 'kaggle_submission.csv'
+SUBMISSION_TEMPLATE = 'kaggle_test_submission.csv'
 
 VALIDATION_SPLIT_SIZE = 0.1 
 CV_FOLDS = 5 
@@ -103,7 +103,7 @@ except Exception as e:
     sys.exit(1)
 
 # ==========================================
-# 2. Preprocessing Helpers
+# 2. Advanced Feature Engineering
 # ==========================================
 
 def parse_height(height_str):
@@ -146,6 +146,29 @@ def clean_medical_text(text):
     text = text.replace('(l)', ' low_abnormal ')
     return text
 
+# --- NEW: Surgical Complexity Score ---
+def calculate_surgical_complexity(text):
+    """
+    Rates the invasiveness of surgery from 1 (Minor) to 4 (Critical).
+    """
+    text = str(text).lower()
+    
+    # Score 4: Critical / Major Open / Vascular
+    if any(x in text for x in ['transplant', 'craniotomy', 'aortic', 'open heart', 'bypass', 'rupture', 'aneurysm', 'amputation']):
+        return 4
+    
+    # Score 3: Major Resection / Open Abdominal / Ortho
+    if any(x in text for x in ['resection', 'open', 'laparotomy', 'total', 'replacement', 'fusion', 'spinal', 'nephrectomy', 'lobectomy']):
+        return 3
+    
+    # Score 2: Moderate / Laparoscopic / Repair
+    if any(x in text for x in ['laparoscopic', 'appendectomy', 'cholecystectomy', 'hernia', 'repair', 'fracture', 'orif']):
+        return 2
+        
+    # Score 1: Minor / Scopy / External (Default)
+    # (colonoscopy, arthroscopy, cystoscopy, cataract, etc.)
+    return 1
+
 def add_specific_disease_flags(df):
     full_text = (
         df['Surgery_Name'].fillna('') + " " + 
@@ -170,21 +193,15 @@ def add_specific_disease_flags(df):
     
     return df
 
-# --- NEW: Critical Device Detection ---
 def add_critical_device_flags(df):
-    """
-    Checks Catheter_Use and properties_display for high-risk invasive devices.
-    """
     full_text = (
         df['Catheter_Use'].fillna('') + " " + 
         df['properties_display'].fillna('')
     ).str.lower()
     
-    # 1. Invasive Monitoring (A-line, CVC, PA Catheter) -> High Risk
     invasive_keywords = ['arterial', 'a-line', 'cvc', 'central', 'picc', 'swan', 'pa catheter', 'pulmonary artery']
     df['Has_Invasive_Monitor'] = full_text.apply(lambda x: 1 if any(k in x for k in invasive_keywords) else 0)
     
-    # 2. Airway Support (Ventilator, ET Tube) -> High Risk
     airway_keywords = ['vent', 'intubat', 'et tube', 'endotracheal', 'trach']
     df['Has_Airway_Support'] = full_text.apply(lambda x: 1 if any(k in x for k in airway_keywords) else 0)
     
@@ -251,9 +268,10 @@ def clean_dataframe(df):
     df['Medication_Count'] = df['Medication_Usage'].apply(count_medications)
     df['Comorbidity_Score'] = df.apply(calculate_comorbidity_score, axis=1)
     
-    df = add_specific_disease_flags(df)
+    # NEW: Surgical Complexity
+    df['Surgical_Complexity'] = df['Surgery_Name'].apply(calculate_surgical_complexity)
     
-    # NEW: Critical Devices
+    df = add_specific_disease_flags(df)
     df = add_critical_device_flags(df)
     
     df['Age_x_Comorbidity'] = df['Age'] * df['Comorbidity_Score']
@@ -272,7 +290,7 @@ def clean_dataframe(df):
     
     return df
 
-print("Preprocessing: ...")
+print("Preprocessing: Neural Nets, Surgical Complexity & MICE...")
 train_clean = clean_dataframe(train_df)
 test_clean = clean_dataframe(test_df)
 
@@ -294,16 +312,15 @@ X_train_split, X_val_split, y_train_split, y_val_split = train_test_split(
 numeric_features = [
     'Age', 'HEIGHT_clean', 'WEIGHT_clean', 'BMI', 
     'Lab_High_Count', 'Lab_Low_Count', 'Lab_Total_Abnormal', 'Medication_Count', 
-    'Comorbidity_Score', 'Age_x_Comorbidity',
+    'Comorbidity_Score', 'Age_x_Comorbidity', 'Surgical_Complexity', # <--- NEW FEATURE
     'Is_Renal', 'Is_Cardiac', 'Is_Neuro', 'Is_Respiratory', 'Is_Cancer',
-    'Has_Invasive_Monitor', 'Has_Airway_Support', # <--- NEW FEATURES
+    'Has_Invasive_Monitor', 'Has_Airway_Support', 
     'Lab_Creatinine', 'Lab_Glucose', 'Lab_Hemoglobin', 'Lab_Potassium', 'Lab_Sodium', 'Lab_Urea nitrogen',
     'Lab_BUN_Creatinine_Ratio'
 ]
 
-# OPTIMIZED: Use IterativeImputer (MICE) instead of SimpleImputer
 numeric_transformer = Pipeline(steps=[
-    ('imputer', IterativeImputer(max_iter=10, random_state=42)), # Smarter filling
+    ('imputer', IterativeImputer(max_iter=10, random_state=42)), 
     ('poly', PolynomialFeatures(degree=2, include_bias=False, interaction_only=True)), 
     ('scaler', MinMaxScaler()),
     ('selector', SelectKBest(f_classif, k=60))
@@ -344,7 +361,7 @@ preprocessor = ColumnTransformer(
     ])
 
 # ==========================================
-# 5. Models
+# 5. Models Definition (With Neural Network)
 # ==========================================
 
 lr_model = LogisticRegression(max_iter=5000, C=1.0, solver='lbfgs', class_weight='balanced')
@@ -352,6 +369,21 @@ dt_model = DecisionTreeClassifier(max_depth=10, min_samples_leaf=30, class_weigh
 knn_model = KNeighborsClassifier(n_neighbors=25, weights='distance', metric='cosine')
 svm_model = SVC(C=0.5, class_weight='balanced', kernel='linear', probability=True, random_state=42)
 ada_model = AdaBoostClassifier(n_estimators=100, learning_rate=0.1, random_state=42)
+
+# --- NEW: Neural Network (MLP) ---
+# A simple 2-layer network. Scaled data is crucial (we handled that).
+# Early stopping enabled to prevent overfitting.
+mlp_model = MLPClassifier(
+    hidden_layer_sizes=(64, 32),
+    activation='relu',
+    solver='adam',
+    alpha=0.001,
+    batch_size=64,
+    learning_rate_init=0.001,
+    max_iter=500,
+    early_stopping=True,
+    random_state=42
+)
 
 # --- 1. Tune Random Forest ---
 print("   [Auto-Tuning] Tuning Random Forest...")
@@ -366,7 +398,7 @@ rf_search = RandomizedSearchCV(estimator=rf_pipeline, param_distributions=rf_par
 rf_search.fit(X_train_split, y_train_split)
 rf_best_model = rf_search.best_estimator_.named_steps['classifier']
 
-# --- 2. Tune HistGradientBoosting (NEW) ---
+# --- 2. Tune HistGradientBoosting ---
 print("   [Auto-Tuning] Tuning HistGradientBoosting...")
 gb_base = HistGradientBoostingClassifier(class_weight='balanced', random_state=42, early_stopping=True)
 gb_param_dist = {
@@ -389,14 +421,21 @@ models = {
     "Method #2 (Decision Tree)": dt_model,
     "Method #3 (KNN)": knn_model,
     "Method #4 (SVM)": svm_model,
-    "Method #5 (HistGradientBoosting - Tuned)": gb_best_model,
-    "Method #6 (AdaBoost)": ada_model
+    "Method #5 (HistGradientBoosting)": gb_best_model,
+    "Method #6 (AdaBoost)": ada_model,
+    "Method #7 (Neural Network)": mlp_model # NEW
 }
 if lgbm_model:
-    models["Method #7 (LightGBM)"] = lgbm_model
+    models["Method #8 (LightGBM)"] = lgbm_model
 
 # --- STRATEGY: BLENDING ---
-estimators_list = [('knn', knn_model), ('svm', svm_model), ('rf', rf_best_model), ('ada', ada_model)]
+estimators_list = [
+    ('knn', knn_model), 
+    ('svm', svm_model), 
+    ('rf', rf_best_model), 
+    ('ada', ada_model),
+    ('mlp', mlp_model) # Add Neural Network to Stack
+]
 if lgbm_model: estimators_list.append(('lgbm', lgbm_model))
 else: estimators_list.append(('hgb', gb_best_model))
 
@@ -406,14 +445,14 @@ stacking_model = StackingClassifier(
     final_estimator=RandomForestClassifier(n_estimators=100, max_depth=5, class_weight='balanced', random_state=42),
     cv=3, n_jobs=1    
 )
-models["Method #8 (Stacking Ensemble)"] = stacking_model
+models["Method #9 (Stacking Ensemble)"] = stacking_model
 
 voting_model = VotingClassifier(
     estimators=estimators_list,
     voting='soft',
     n_jobs=1
 )
-models["Method #9 (Voting Classifier)"] = voting_model
+models["Method #10 (Voting Classifier)"] = voting_model
 
 # ==========================================
 # 6. Training & Execution
@@ -460,10 +499,9 @@ for name, model in models.items():
 
     val_preds = clf.predict(X_val_split)
     val_f1 = f1_score(y_val_split, val_preds, average='macro')
+    print(f"   [Local Validation] Macro F1 Score: {val_f1:.4f}")
     
-    print(f"   [Local Validation] Macro F1 Score ({int(VALIDATION_SPLIT_SIZE*100)}%): {val_f1:.4f}")
-    
-    # B. Cross Validation (Uses CV_FOLDS variable)
+    # B. Cross Validation
     cv = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=42)
     scoring = {
         'f1_macro': 'f1_macro', 'prec_macro': 'precision_macro', 'rec_macro': 'recall_macro',
@@ -491,11 +529,9 @@ for name, model in models.items():
     clf.fit(X, y) 
     predictions = clf.predict(X_test)
     
-    short_name = name.split('(')[1].split(')')[0].replace(" ", "")
-    filename = f"kaggle_submission_{short_name}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
-    if len(submission_ids) != len(predictions):
-        submission_ids = range(0, len(predictions))
-
+    short_name = name.split('(')[1].split(')')[0].replace(" ", "").replace("#", "")
+    filename = f"kaggle_submission_{short_name}.csv"
+    
     submission_df = pd.DataFrame({'Id': submission_ids, 'ASA_Rating': predictions})
     submission_df.to_csv(filename, index=False)
     print(f"   Saved: {filename}")
@@ -526,4 +562,4 @@ if best_stacking_pipeline and best_voting_pipeline:
     print(f"   Saved Blended Submission: {filename}")
 
 print("\n" + "="*60)
-print(f"ALL DONE! Output recorded in 'output_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.txt'.")
+print(f"ALL DONE! Output recorded in '{sys.stdout.filename}'.")
