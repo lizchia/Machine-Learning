@@ -79,7 +79,7 @@ TEST_PATH = 'kaggle_test_dataset.csv'
 SUBMISSION_TEMPLATE = 'kaggle_submission.csv'
 
 VALIDATION_SPLIT_SIZE = 0.1 
-CV_FOLDS = 10
+CV_FOLDS = 5 
 
 print(f"Configuration: Using {CV_FOLDS} Cross-Validation Folds.")
 print("Loading data...")
