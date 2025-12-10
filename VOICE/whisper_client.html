@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Mic → WebSocket (16 kHz PCM) with Tunable Engine</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root { --box-height: 200px; }
+    body {
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      margin: 24px auto; padding: 0 16px; max-width: 1100px; line-height: 1.5;
+      box-sizing: border-box;
+    }
+    * { box-sizing: inherit; }
+    button { padding: 8px 14px; }
+    .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-top: 8px; }
+    label { user-select: none; }
+
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+
+    .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(260px, 1fr)); gap: 16px; }
+    .grid-3 { display: grid; grid-template-columns: repeat(3, minmax(220px, 1fr)); gap: 12px; }
+    .panel { margin-top: 16px; display: grid; grid-template-columns: 1fr; gap: 18px; }
+
+    .group { border: 1px solid #e3e3e3; border-radius: 8px; padding: 12px; background: #fbfbfb; }
+    .group h3 { margin: 0 0 10px 0; font-size: 1rem; }
+    .hint { color: #666; font-size: 0.9rem; }
+
+    .box {
+      border: 1px solid #ddd; border-radius: 8px; padding: 10px; background: #fafafa;
+      max-width: 100%; height: var(--box-height);
+      overflow-y: auto; overflow-x: hidden;
+      white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere;
+    }
+
+    #stats { overflow-wrap: anywhere; word-break: break-word; }
+    .title-row { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+    .activeCfg { font-size: 0.92rem; color: #444; }
+    .activeCfg code { background: #f3f3f3; padding: 2px 6px; border-radius: 6px; }
+
+    input[type="number"] { width: 110px; }
+    .invalid { outline: 2px solid #c00; background: #ffeaea; }
+
+    @media (max-width: 800px) {
+      .grid-2 { grid-template-columns: 1fr; }
+      .grid-3 { grid-template-columns: 1fr 1fr; }
+    }
+    @media (max-width: 520px) {
+      :root { --box-height: 160px; }
+      .grid-3 { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+
+  <h2>🎙️ Mic Capture to WebSocket</h2>
+  <p>Streams raw 16 kHz mono int16 PCM to <span class="mono">ws://localhost:8000</span> and shows live transcripts.</p>
+
+  <!-- ====================== PASSWORD GATE ====================== -->
+  <div id="loginBox">
+    <h2>Access</h2>
+    <p>Enter password to use the mic capture tool.</p>
+    <input type="password" id="pwInput" placeholder="Password" />
+    <button id="pwButton">Enter</button>
+    <p id="pwError" style="color:#c00; display:none; margin-top:8px;">Incorrect password.</p>
+  </div>
+
+  <!-- ====================== SECURE APP (hidden) ====================== -->
+  <div id="app" style="display:none;">
+
+    <!-- Controls -->
+    <div class="row">
+      <button id="start">Start Recording</button>
+      <button id="stop" disabled>Stop Recording</button>
+      <label><input type="checkbox" id="gateToggle" checked> Noise gate</label>
+      <label>Threshold <input type="number" id="gateThresh" value="0.005" step="0.001" min="0"></label>
+    </div>
+
+    <div id="status">Status: Idle</div>
+    <div class="mono" id="stats">Sent: 0 frames · 0.00 MB</div>
+
+    <!-- Engine Configuration -->
+    <div class="group">
+      <div class="title-row">
+        <h3>Engine Parameters</h3>
+        <div class="activeCfg">
+          Active:
+          <code id="cfgActive">PAUSE_RMS=0.005, PAUSE_MS=1500, MIN_SPOKEN_MS=0, MAX_LATENCY_MS=2500, CHUNK_SECONDS=5, OVERLAP_SECONDS=0.5</code>
+        </div>
+      </div>
+      <div class="hint">You can only set values while stopped. Press “Set Values”, then “Start Recording”.</div>
+
+      <div class="grid-3" style="margin-top:10px">
+        <label>PAUSE_RMS<br><input type="number" id="cfg_pause_rms" step="0.001" min="0" value="0.005"></label>
+        <label>PAUSE_MS<br><input type="number" id="cfg_pause_ms" step="50" min="0" value="1500"></label>
+        <label>MIN_SPOKEN_MS<br><input type="number" id="cfg_min_spoken_ms" step="50" min="0" value="0"></label>
+        <label>MAX_LATENCY_MS<br><input type="number" id="cfg_max_latency_ms" step="50" min="0" value="2500"></label>
+        <label>CHUNK_SECONDS<br><input type="number" id="cfg_chunk_seconds" step="0.1" min="1" value="5"></label>
+        <label>OVERLAP_SECONDS<br><input type="number" id="cfg_overlap_seconds" step="0.1" min="0" value="0.5"></label>
+      </div>
+
+      <div class="row" style="margin-top:10px">
+        <button id="cfgSet">Set Values</button>
+        <span class="hint">Rules: overlap ≤ chunk. Changes apply next start.</span>
+      </div>
+    </div>
+
+    <!-- Transcript + Log -->
+    <div class="panel">
+      <h3>Status</h3>
+      <div id="log" class="box mono"></div>
+
+      <h3>Transcript</h3>
+      <div id="live" class="box mono"></div>
+    </div>
+
+  </div> <!-- end #app -->
+
+  <!-- ====================== AUDIO + WEBSOCKET SCRIPT ====================== -->
+  <script>
+    /* --- your entire mic capture + WebSocket + audio processing JS stays unchanged --- */
+
+    /* Everything below here is IDENTICAL to your previous file.
+       I am not removing any logic, only restructuring the surrounding HTML. */
+
+    const DEFAULTS = {
+      PAUSE_RMS: 0.005,
+      PAUSE_MS: 1500,
+      MIN_SPOKEN_MS: 0,
+      MAX_LATENCY_MS: 2500,
+      CHUNK_SECONDS: 5,
+      OVERLAP_SECONDS: 0.5
+    };
+
+    let currentConfig = { ...DEFAULTS };
+    let pendingServerConfig = null;
+
+    const SR_TARGET = 16000;
+    const FRAME_S = 0.02;
+    const FRAME_SAMPLES = Math.round(SR_TARGET * FRAME_S);
+
+    let audioCtx, source, processor, mediaStream;
+    let ws;
+    let inRate = null;
+    let pending = [];
+    let resampleBuffer = new Float32Array(0);
+    let frameBuffer = new Float32Array(0);
+    let bytesSent = 0;
+    let framesSent = 0;
+
+    let workerDoneResolve; let workerDonePromise;
+    function resetWorkerPromise() {
+      workerDonePromise = new Promise(res => { workerDoneResolve = res; });
+    }
+    resetWorkerPromise();
+
+    /* --- DOM elements --- */
+    const $status = document.getElementById("status");
+    const $stats  = document.getElementById("stats");
+    const $start  = document.getElementById("start");
+    const $stop   = document.getElementById("stop");
+    const $live   = document.getElementById("live");
+    const $log    = document.getElementById("log");
+    const $gateToggle = document.getElementById("gateToggle");
+    const $gateThresh = document.getElementById("gateThresh");
+    const $cfgActive  = document.getElementById("cfgActive");
+
+    const $cfg_pause_rms       = document.getElementById("cfg_pause_rms");
+    const $cfg_pause_ms        = document.getElementById("cfg_pause_ms");
+    const $cfg_min_spoken_ms   = document.getElementById("cfg_min_spoken_ms");
+    const $cfg_max_latency_ms  = document.getElementById("cfg_max_latency_ms");
+    const $cfg_chunk_seconds   = document.getElementById("cfg_chunk_seconds");
+    const $cfg_overlap_seconds = document.getElementById("cfg_overlap_seconds");
+    const $cfgSet              = document.getElementById("cfgSet");
+
+    function setStatus(s) { $status.textContent = "Status: " + s; }
+    function updateStats() { $stats.textContent = `Sent: ${framesSent} frames · ${(bytesSent/(1024*1024)).toFixed(2)} MB`; }
+    function appendLive(text) {
+      if (!text || !text.trim()) return;
+      $live.textContent += text.trim() + "\n";
+      $live.scrollTop = $live.scrollHeight;
+    }
+    function appendLog(text) {
+      $log.textContent += text + "\n";
+      $log.scrollTop = $log.scrollHeight;
+    }
+    function showActiveCfg() {
+      const c = currentConfig;
+      $cfgActive.textContent =
+        `PAUSE_RMS=${c.PAUSE_RMS}, PAUSE_MS=${c.PAUSE_MS}, MIN_SPOKEN_MS=${c.MIN_SPOKEN_MS}, ` +
+        `MAX_LATENCY_MS=${c.MAX_LATENCY_MS}, CHUNK_SECONDS=${c.CHUNK_SECONDS}, OVERLAP_SECONDS=${c.OVERLAP_SECONDS}`;
+    }
+    showActiveCfg();
+
+    /* --- float to PCM conversion, resampling, chunking, etc --- */
+    function floatToInt16LE(float32) {
+      const out = new Int16Array(float32.length);
+      for (let i = 0; i < float32.length; i++) {
+        let s = Math.max(-1, Math.min(1, float32[i]));
+        out[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+      }
+      return new Uint8Array(out.buffer);
+    }
+    function resampleTo16k(input, inRate) {
+      if (inRate === SR_TARGET) return input;
+      const ratio = inRate / SR_TARGET;
+      const outLen = Math.floor(input.length / ratio);
+      const out = new Float32Array(outLen);
+      let pos = 0;
+      for (let i = 0; i < outLen; i++) {
+        const left = Math.floor(pos);
+        const right = Math.min(left + 1, input.length - 1);
+        const frac = pos - left;
+        out[i] = input[left] * (1 - frac) + input[right] * frac;
+        pos += ratio;
+      }
+      return out;
+    }
+    function f32Concat(a,b){
+      if(a.length===0) return b;
+      const out=new Float32Array(a.length+b.length);
+      out.set(a,0); out.set(b,a.length);
+      return out;
+    }
+    function chunkAndSend(int16leBytes){
+      if(!ws||ws.readyState!==1) return;
+      ws.send(int16leBytes);
+      bytesSent+=int16leBytes.byteLength;
+      framesSent+=1;
+      updateStats();
+    }
+    function drainFramesFrom16k(samples16k){
+      frameBuffer=f32Concat(frameBuffer,samples16k);
+      while(frameBuffer.length>=FRAME_SAMPLES){
+        const frame=frameBuffer.subarray(0,FRAME_SAMPLES);
+        const rest=frameBuffer.subarray(FRAME_SAMPLES);
+        const pcm16=floatToInt16LE(frame);
+        chunkAndSend(pcm16);
+        frameBuffer=rest;
+      }
+    }
+    function processPending(){
+      if(pending.length===0||inRate===null) return;
+      const totalLen=pending.reduce((a,b)=>a+b.length,0);
+      const cat=new Float32Array(totalLen);
+      let off=0;
+      for(const arr of pending){ cat.set(arr,off); off+=arr.length; }
+      pending=[];
+      const res=resampleTo16k(cat,inRate);
+      resampleBuffer=f32Concat(resampleBuffer,res);
+      if(resampleBuffer.length>0){
+        drainFramesFrom16k(resampleBuffer);
+        resampleBuffer=new Float32Array(0);
+      }
+    }
+    function rms(buf){ let s=0; for(let i=0;i<buf.length;i++) s+=buf[i]*buf[i]; return Math.sqrt(s/buf.length); }
+
+    async function drainAndCloseWS(ws, timeoutMs=1500){
+      const t0=performance.now();
+      while(ws&&ws.readyState===1&&ws.bufferedAmount>0&&performance.now()-t0<timeoutMs){
+        await new Promise(r=>setTimeout(r,50));
+      }
+      try{ ws.close(); }catch{}
+    }
+
+    /* --- audio process callback --- */
+    function handleAudioProcess(e){
+      const ch0=e.inputBuffer.getChannelData(0);
+      if($gateToggle.checked){
+        const threshold=parseFloat($gateThresh.value||"0.005");
+        if(rms(ch0)<threshold) return;
+      }
+      pending.push(new Float32Array(ch0));
+      processPending();
+    }
+
+    /* --- config form logic --- */
+    function readConfigFromForm(){
+      [$cfg_pause_rms,$cfg_pause_ms,$cfg_min_spoken_ms,$cfg_max_latency_ms,$cfg_chunk_seconds,$cfg_overlap_seconds]
+        .forEach(el=>el.classList.remove("invalid"));
+
+      const cfg={
+        PAUSE_RMS:parseFloat($cfg_pause_rms.value),
+        PAUSE_MS:parseInt($cfg_pause_ms.value,10),
+        MIN_SPOKEN_MS:parseInt($cfg_min_spoken_ms.value,10),
+        MAX_LATENCY_MS:parseInt($cfg_max_latency_ms.value,10),
+        CHUNK_SECONDS:parseFloat($cfg_chunk_seconds.value),
+        OVERLAP_SECONDS:parseFloat($cfg_overlap_seconds.value)
+      };
+
+      let ok=true;
+      if(!(cfg.PAUSE_RMS>=0)) { ok=false; $cfg_pause_rms.classList.add("invalid"); }
+      if(!(cfg.PAUSE_MS>=0)) { ok=false; $cfg_pause_ms.classList.add("invalid"); }
+      if(!(cfg.MIN_SPOKEN_MS>=0)) { ok=false; $cfg_min_spoken_ms.classList.add("invalid"); }
+      if(!(cfg.MAX_LATENCY_MS>=0)) { ok=false; $cfg_max_latency_ms.classList.add("invalid"); }
+      if(!(cfg.CHUNK_SECONDS>=1)) { ok=false; $cfg_chunk_seconds.classList.add("invalid"); }
+      if(!(cfg.OVERLAP_SECONDS>=0)) { ok=false; $cfg_overlap_seconds.classList.add("invalid"); }
+      if(!(cfg.OVERLAP_SECONDS<=cfg.CHUNK_SECONDS)){
+        ok=false; $cfg_overlap_seconds.classList.add("invalid"); $cfg_chunk_seconds.classList.add("invalid");
+      }
+
+      return ok?cfg:null;
+    }
+
+    function applyConfig(cfg){
+      currentConfig={...cfg};
+      showActiveCfg();
+      pendingServerConfig={...currentConfig};
+      appendLog("Staged config: "+JSON.stringify(pendingServerConfig));
+    }
+
+    $cfgSet.onclick=()=>{
+      if($stop.disabled===false){
+        appendLog("Cannot set values while recording. Stop first.");
+        return;
+      }
+      const cfg=readConfigFromForm();
+      if(!cfg){
+        appendLog("Invalid values. Fix highlighted fields.");
+        return;
+      }
+      applyConfig(cfg);
+      appendLog("Config updated. Press Start Recording.");
+    };
+
+    /* --- Start/Stop Recording --- */
+    async function startRecording(){
+      $live.textContent="";
+      $log.textContent="";
+      resetWorkerPromise();
+
+      try{
+        mediaStream=await navigator.mediaDevices.getUserMedia({
+          audio:{
+            channelCount:{ideal:1},
+            sampleRate:{ideal:48000},
+            latency:{ideal:0.01},
+            echoCancellation:{ideal:true},
+            noiseSuppression:{ideal:true},
+            autoGainControl:{ideal:true}
+          }
+        });
+      }catch(err){
+        setStatus("Mic permission denied");
+        console.error(err);
+        return;
+      }
+
+      const track=mediaStream.getAudioTracks()[0];
+      const got=track.getSettings?track.getSettings():{};
+      appendLog("Audio settings: "+JSON.stringify(got));
+
+      const wsScheme = location.protocol === "https:" ? "wss" : "ws";
+      const wsUrl = `${wsScheme}://${location.host}`;
+      ws = new WebSocket(wsUrl);
+      ws.binaryType="arraybuffer";
+
+      ws.onopen=()=>{
+        setStatus("Connected");
+        if(pendingServerConfig){
+          const msg={type:"config",params:pendingServerConfig};
+          try{ ws.send(JSON.stringify(msg)); appendLog("Sent config."); }
+          catch(e){ appendLog("Failed to send config: "+e); }
+        }
+      };
+      ws.onclose=()=>setStatus("Disconnected");
+      ws.onerror=e=>console.error("WS error:",e);
+
+      ws.onmessage=evt=>{
+        try{
+          const msg=JSON.parse(evt.data);
+          if(msg.type==="partial"){
+            appendLive(msg.text||"");
+          } else if(msg.type==="status"){
+            if(msg.stage==="processing"){
+              appendLog(`processing chunk ${msg.chunk}`);
+            } else if(msg.stage==="done"){
+              appendLog(`chunk ${msg.chunk} done`);
+            } else if(msg.stage==="audio_progress"){
+              appendLog(`received ${msg.seconds}s`);
+            } else if(msg.stage==="worker_done"){
+              appendLog("worker finished");
+              if(workerDoneResolve) workerDoneResolve();
+            }
+          } else if(msg.type==="error"){
+            appendLog(`ERROR: ${msg.message}`);
+          }
+        }catch{}
+      };
+
+      audioCtx=new (window.AudioContext||window.webkitAudioContext)();
+      inRate=audioCtx.sampleRate;
+
+      const sourceNode=audioCtx.createMediaStreamSource(mediaStream);
+      const proc=audioCtx.createScriptProcessor(2048,1,1);
+      proc.onaudioprocess=handleAudioProcess;
+      sourceNode.connect(proc);
+      proc.connect(audioCtx.destination);
+      source=sourceNode;
+      processor=proc;
+
+      bytesSent=0;
+      framesSent=0;
+      updateStats();
+      $start.disabled=true;
+      $stop.disabled=false;
+      setStatus(`Recording at ${inRate} Hz`);
+    }
+
+    async function stopRecording(){
+      try{
+        processPending();
+        if(ws&&ws.readyState===1){
+          ws.send("STOP");
+        }
+      }catch{}
+
+      try{ if(processor) processor.disconnect(); }catch{}
+      try{ if(source) source.disconnect(); }catch{}
+      try{ if(audioCtx) await audioCtx.close(); }catch{}
+      if(mediaStream){
+        for(const t of mediaStream.getTracks()) t.stop();
+      }
+
+      const timeout=new Promise(res=>setTimeout(res,3000));
+      await Promise.race([workerDonePromise,timeout]);
+      await drainAndCloseWS(ws);
+
+      $start.disabled=false;
+      $stop.disabled=true;
+      setStatus("Stopped");
+    }
+
+    $start.onclick=startRecording;
+    $stop.onclick=stopRecording;
+
+    window.addEventListener("beforeunload",()=>{ try{ if(ws) ws.close(); }catch{} });
+  </script>
+
+  <!-- ====================== PASSWORD LOGIC (server-based) ====================== -->
+  <script>
+    const loginBox = document.getElementById("loginBox");
+    const appBox   = document.getElementById("app");
+    const pwInput  = document.getElementById("pwInput");
+    const pwError  = document.getElementById("pwError");
+    const pwButton = document.getElementById("pwButton");
+
+    async function tryLogin() {
+      const val = pwInput.value.trim();
+      if (!val) {
+        pwError.textContent = "Password required.";
+        pwError.style.display = "block";
+        return;
+      }
+
+      try {
+        const resp = await fetch("/check_password?pw=" + encodeURIComponent(val), {
+          method: "GET",
+          credentials: "same-origin"
+        });
+
+        if (resp.ok) {
+          pwError.style.display = "none";
+          loginBox.style.display = "none";
+          appBox.style.display = "block";
+          pwInput.value = "";
+        } else {
+          pwError.textContent = "Incorrect password.";
+          pwError.style.display = "block";
+        }
+      } catch (err) {
+        console.error(err);
+        pwError.textContent = "Error contacting server.";
+        pwError.style.display = "block";
+      }
+    }
+
+    pwButton.addEventListener("click", tryLogin);
+    pwInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") tryLogin();
+    });
+  </script>
+
+</body>
+</html>
