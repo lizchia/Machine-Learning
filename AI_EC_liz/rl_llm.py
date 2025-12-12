@@ -5,13 +5,38 @@ import re
 import os
 from openai import AsyncOpenAI
 from tqdm.asyncio import tqdm
+from dotenv import load_dotenv
 
-# ================= ⚙️ 設定區 =================
+# 1. 嘗試載入 .env 檔案
+# 如果載入成功，它會回傳 True；如果找不到檔案，回傳 False
+if not load_dotenv():
+    print("⚠️  警告：找不到 .env 檔案。")
+    print("請確認您已將 .env.example 複製為 .env 並填入 API Key。")
+    # 視情況決定要不要強制結束程式
+    # sys.exit(1)
+
+# 2. 讀取變數
+api_key = os.getenv("OPENAI_API_KEY")
+model_name = os.getenv("OPENAI_MODEL_NAME", "gpt-3.5-turbo")
+base_url = os.getenv("BASE_URL")
+debug_mode = os.getenv("DEBUG_MODE", "False").lower() == "true"
+
+# 3. 檢查關鍵變數是否存在
+if not api_key:
+    print("❌ 錯誤：未偵測到 OPENAI_API_KEY！無法執行後續程式。")
+    sys.exit(1)
+
+# 4. (測試用) 印出當前設定 (注意：不要印出完整的 api_key)
+if debug_mode:
+    print(f"✅ 環境載入成功")
+    print(f"   - 使用模型: {model_name}")
+    print(f"   - API Key: {api_key[:8]}********") # 只印前8碼檢查用
+    print("-----------------------------------")
+
 client = AsyncOpenAI(
-    api_key="sk-MPJDP7Wi0omLE0pvxFUJ0g",
-    base_url="http://192.168.150.73:4000/v1"
+    api_key = api_key,
+    base_url = base_url
 )
-model_name = "llama70b"
 
 # 檔案路徑
 ORIGINAL_CSV = "final_dataset.csv"
@@ -19,7 +44,7 @@ OUTPUT_FILE = "final_merged_dataset.csv"  # 最終產出的完整檔案
 TEMP_FILE = "temp_synthetic_data.csv"     # 暫存檔
 
 # 生成目標
-TARGET_COUNT = 10 # 測試用，您可以改為 27344
+TARGET_COUNT = 5 # 測試用，您可以改為 27344
 CONCURRENT_LIMIT = 5
 # ============================================
 
